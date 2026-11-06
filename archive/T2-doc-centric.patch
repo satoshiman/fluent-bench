@@ -1,0 +1,79 @@
+From 78111874b33bb0d89947830e4e6645957b98b6e4 Mon Sep 17 00:00:00 2001
+From: Satoshi Man <mrvuong.bitcoin@gmail.com>
+Date: Thu, 5 Nov 2026 19:51:13 +0700
+Subject: [PATCH] log: transient LLM retry with exponential backoff
+
+---
+ CONTEXTS/04-logs/2026-11-05.md | 42 ++++++++++++++++++++++++++++++++--
+ 1 file changed, 40 insertions(+), 2 deletions(-)
+
+diff --git a/CONTEXTS/04-logs/2026-11-05.md b/CONTEXTS/04-logs/2026-11-05.md
+index a251d67..50f5688 100644
+--- a/CONTEXTS/04-logs/2026-11-05.md
++++ b/CONTEXTS/04-logs/2026-11-05.md
+@@ -1,11 +1,11 @@
+ ---
+ date: "2026-11-05"
+-events_count: 88
++events_count: 89
+ ---
+ 
+ # Events on 2026-11-05
+ 
+-Total events: **88**
++Total events: **89**
+ 
+ ## Table of contents
+ 
+@@ -97,6 +97,7 @@ Total events: **88**
+ - [17:56 - Add README and MIT license](#1756---add-readme-and-mit-license)
+ - [17:58 - Update license copyright to real name](#1758---update-license-copyright-to-real-name)
+ - [18:31 - Standardize workflow name in README](#1831---standardize-workflow-name-in-readme)
++- [19:51 - Transient LLM retry with exponential backoff (PLAN-012)](#1951---transient-llm-retry-with-exponential-backoff-plan-012)
+ 
+ ---
+ 
+@@ -3124,3 +3125,40 @@ README.md
+ None
+ 
+ ---
++## 19:51 - Transient LLM retry with exponential backoff (PLAN-012)
++
++**Scope:** server/translate | **Type:** Feature | **Commit:** 14c7f52 @ doc-centric
++
++## Scope
++server/translate
++
++## Type
++Feature
++
++## Commit
++- **Hash:** 14c7f52
++- **Repo:** doc-centric
++- **Message:** Retry transient LLM failures with exponential backoff (PLAN-012)
++- **Author:** Satoshi Man <mrvuong.bitcoin@gmail.com>
++- **Date:** 2026-11-05 19:51:00 +0700
++
++## User request
++Add retry with exponential backoff for translation API calls: transient failures only (network, 5xx, 429), 500ms base doubling up to 3 attempts with jitter, immediate failure on other 4xx and malformed responses, same error path on exhaustion, tests must not hit the real API. Done when npm test and npm run typecheck pass.
++
++## Reason
++Transient provider blips previously burned the single primary->fallback hop and the session-level queued retry. In-request exponential backoff (PLAN-012, verified against ADR-003/BDR-002, review_count 1) absorbs them cheaply; exhaustion still surfaces as TranslationError through translateSegment unchanged.
++
++## Description
++Added withRetry + isTransientLlmError in server/translate/retry.ts and wrapped chat.completions.create in OpenAICompatTranslator.request. Retryable: HTTP 429/5xx and status-less transport failures; other 4xx and post-response TranslationErrors fail immediately. Backoff: 500ms base doubling, +/-10% jitter, 3 attempts per endpoint (primary then fallback chain unchanged per ADR-003). New retry.test.ts plus translator-level tests for 5xx/429/network retry, 4xx immediate failure, 3-attempt exhaustion, and malformed-response no-retry.
++
++## Files changed
++server/translate/retry.ts
++server/translate/retry.test.ts
++server/translate/openai-compat.ts
++server/translate/openai-compat.test.ts
++CONTEXTS/03-implement-plan/PLAN-012-llm-transient-retry.md
++
++## Notes
++Retry-After header not honored; assist path intentionally untouched (PLAN-009 pinned best-effort single attempt); worst case 3x3 plus fallback provider calls per segment under sustained outage.
++
++---
+-- 
+2.50.0
+

@@ -1,0 +1,770 @@
+From 14c7f524925a6e4981d70270547f6c72e4dc492b Mon Sep 17 00:00:00 2001
+From: Satoshi Man <mrvuong.bitcoin@gmail.com>
+Date: Thu, 5 Nov 2026 19:51:00 +0700
+Subject: [PATCH 1/2] Retry transient LLM failures with exponential backoff
+ (PLAN-012)
+
+---
+ .../PLAN-012-llm-transient-retry.md           | 256 ++++++++++++++++++
+ server/translate/openai-compat.test.ts        | 141 +++++++++-
+ server/translate/openai-compat.ts             |  13 +-
+ server/translate/retry.test.ts                | 122 +++++++++
+ server/translate/retry.ts                     |  54 ++++
+ 5 files changed, 581 insertions(+), 5 deletions(-)
+ create mode 100644 CONTEXTS/03-implement-plan/PLAN-012-llm-transient-retry.md
+ create mode 100644 server/translate/retry.test.ts
+ create mode 100644 server/translate/retry.ts
+
+diff --git a/CONTEXTS/03-implement-plan/PLAN-012-llm-transient-retry.md b/CONTEXTS/03-implement-plan/PLAN-012-llm-transient-retry.md
+new file mode 100644
+index 0000000..a71a2ae
+--- /dev/null
++++ b/CONTEXTS/03-implement-plan/PLAN-012-llm-transient-retry.md
+@@ -0,0 +1,256 @@
++---
++id: PLAN-012-llm-transient-retry
++status: implemented
++date: 2026-11-05
++review_count: 1
++patch: not-needed
++---
++
++# PLAN-012: Exponential-backoff retry for transient LLM API failures
++
++## Status
++
++implemented
++
++## Context
++
++The translation pipeline calls an OpenAI-compatible LLM endpoint.
++Transient failures (network drops, HTTP 5xx, HTTP 429 rate limiting)
++currently surface immediately: `OpenAICompatTranslator.request` makes a
++single `chat.completions.create` call, `translate` falls back once, and
++the session-level queue in `SessionManager.translateSegment`
++(`translationAttempts` / `RETRY_DELAY_MS`) is the only retry. There is no
++short backoff inside a request, so a blip on the provider burns a
++session-level attempt and shows up as a delayed or missing translation.
++
++Developer task: retry transient failures only, inside the request path,
++with exponential backoff - base delay 500ms, doubling, up to 3 attempts,
++small random jitter. Non-retryable failures (other 4xx, malformed
++responses) fail immediately. Exhaustion surfaces through the existing
++error path (`translate` rejecting). Successful responses are never
++retried. Tests must not hit the real API.
++
++## Governing records
++
++- ADR-003: translation runs on `final` segments through one
++  OpenAI-compatible client shape with a single primary->fallback hop;
++  on total failure the segment keeps English text and a retry is queued,
++  the transcript is never blocked. This plan adds backoff *inside* each
++  endpoint request; the primary->fallback structure and the manager's
++  queued retry are unchanged.
++- BDR-002: cost ceiling $2.00/audio hour. Retries are bounded to 3
++  attempts and only fire on failure, so the extra spend is a rounding
++  error vs. the per-segment calls that already exist.
++- ADR-005: no new config or secrets; retry parameters are code
++  constants, not env vars.
++- ADR-006: no new dependencies; vitest + the `openai` SDK already
++  provide everything needed.
++- PLAN-009 (implemented): pinned "no retries beyond fallback" for the
++  answer-assist path - this plan deliberately does not touch
++  `server/assist/`.
++
++## Scope
++
++In scope:
++
++1. `server/translate/retry.ts` (new): a generic `withRetry` helper plus
++   the transient-failure classifier.
++2. `server/translate/openai-compat.ts`: wrap the
++   `chat.completions.create` call in `withRetry`; add an optional
++   constructor parameter for test-injected retry options.
++3. `server/translate/retry.test.ts` (new): unit tests for the helper.
++4. `server/translate/openai-compat.test.ts`: new retry behavior tests
++   and updated expectations where the new behavior changes call counts.
++
++Out of scope:
++
++- `server/assist/` (pinned single-attempt in PLAN-009).
++- The session-level retry in `SessionManager.translateSegment`; it stays
++  as the outer layer per ADR-003.
++- Configurable retry knobs via env (constants are fine for now).
++- `Retry-After` response-header handling (a refinement; noted in Risks).
++
++## Design decisions (pinned)
++
++**Retry boundary.** `withRetry` wraps only the SDK call
++(`client.chat.completions.create`), not response parsing. Domain errors
++raised after a resolved response (`TranslationError('empty translation
++response')`) can never enter the retry loop, so malformed/empty
++responses fail immediately by construction.
++
++**Transient classification.** An error is transient when:
++
++- it carries a numeric `status` that is `429` or `>= 500` (the `openai`
++  SDK puts the HTTP status on thrown `APIError`s), or
++- it carries no numeric `status` at all - SDK connection/timeout errors
++  (`APIConnectionError`, `APIConnectionTimeoutError`) and Node transport
++  failures (`ECONNRESET`, `ENOTFOUND`, `fetch failed`) all reject
++  without an HTTP status.
++
++Any error with a numeric status that is not 429/5xx (i.e. other 4xx) is
++non-retryable.
++
++**Contract** (`server/translate/retry.ts`, verbatim signatures):
++
++```ts
++export interface LlmRetryOptions {
++  /** Total attempts including the first call. Default 3. */
++  attempts?: number;
++  /** Base backoff delay in ms. Default 500. */
++  baseDelayMs?: number;
++  /** Injectable for tests; defaults to setTimeout-based sleep. */
++  sleep?: (ms: number) => Promise<void>;
++  /** Injectable for tests; defaults to Math.random. */
++  random?: () => number;
++}
++
++export function isTransientLlmError(err: unknown): boolean;
++
++export async function withRetry<T>(
++  fn: () => Promise<T>,
++  isRetryable: (err: unknown) => boolean,
++  options?: LlmRetryOptions,
++): Promise<T>;
++```
++
++**Backoff.** After failed attempt `i` (1-based, `i < attempts`), wait
++
++```
++delay_i = baseDelayMs * 2^(i - 1) * (0.9 + 0.2 * random())
++```
++
++i.e. ~500ms then ~1000ms for defaults, jittered +/-10%. With
++`random: () => 0.5` the factor is exactly 1.0, giving deterministic
++500/1000 delays in tests. After the last attempt fails, `withRetry`
++rethrows that attempt's error unchanged - the caller's existing
++try/catch wraps it in `TranslationError` exactly as today.
++
++**Wiring** (`server/translate/openai-compat.ts`):
++
++- `OpenAICompatTranslator` gains an optional 4th constructor parameter
++  `retry: LlmRetryOptions = {}` stored as `private readonly retry`.
++- `request()` replaces the direct call with:
++
++```ts
++const res = (await withRetry(
++  () =>
++    client.chat.completions.create(body as never) as Promise<OpenAI.ChatCompletion>,
++  isTransientLlmError,
++  this.retry,
++)) as OpenAI.ChatCompletion;
++```
++
++- Each endpoint gets its own up-to-3-attempts retry: primary 3 attempts,
++  then (if configured) fallback 3 attempts. The primary->fallback chain
++  in `translate()` is untouched, so ADR-003's "retries once on the
++  fallback" still holds at the endpoint level.
++- `makeTranslator` signature is unchanged (defaults suffice; tests use
++  the class directly as they already do).
++
++**Error path.** Exhausted retries rethrow the last raw error;
++`translate()` wraps it in `TranslationError` with the existing messages;
++`SessionManager.translateSegment` catches it, warns, and either queues
++the session-level retry or broadcasts `TRANSLATION_FAILED`. No silent
++swallowing, no caller changes.
++
++## Steps
++
++### Step 1 - `server/translate/retry.ts` (new)
++
++Implement `LlmRetryOptions`, `isTransientLlmError`, `withRetry` per the
++pinned contract and backoff formula. `attempts` values below 1 clamp to
++1. `sleep` defaults to
++`(ms) => new Promise<void>((r) => setTimeout(r, ms))`, `random` defaults
++to `Math.random`.
++
++### Step 2 - `server/translate/openai-compat.ts`
++
++Add the `retry` constructor parameter, import `withRetry` /
++`isTransientLlmError`, wrap the `create` call in `request()`.
++
++### Step 3 - tests
++
++- New `server/translate/retry.test.ts` (below).
++- Update `server/translate/openai-compat.test.ts`: the `fail` behavior
++  in `fakeClient` currently throws a bare `Error` (no status), which the
++  classifier treats as transient, so the two fallback tests now observe
++  3 primary calls. Pass `retry: { sleep: async () => {} }` into those
++  translator instances for speed and update `calls` expectations to
++  `['https://p', 'https://p', 'https://p', 'https://f']` /
++  `['https://p' x3, 'https://f' x3]`; add the new retry tests (below).
++
++## Test plan
++
++Automated (vitest, existing fake-`ClientFactory` pattern; no real API
++access anywhere):
++
++`server/translate/retry.test.ts`:
++
++- resolves on first success without sleeping (fn called once, no sleeps
++  recorded).
++- retries a retryable failure then succeeds; with `random: () => 0.5`
++  recorded sleeps are `[500, 1000]` after 2 failures before success.
++- a failure the predicate rejects is rethrown immediately, fn called
++  once, no sleeps.
++- exhaustion: `attempts: 3`, always failing -> fn called 3 times, the
++  last error object rethrown (`toBe`).
++- `attempts: 1` never retries.
++
++`server/translate/openai-compat.test.ts` (additions; all translators
++constructed with `{ sleep: async () => {} }`):
++
++- **5xx then success**: scripted `create` throws `{status: 500}` once
++  then returns a valid completion -> resolves, `create` called twice on
++  the primary, no fallback call.
++- **immediate failure on 4xx**: `create` throws `{status: 400}` ->
++  rejects `TranslationError` (no fallback configured), `create` called
++  once.
++- **429 retried**: `{status: 429}` once then ok -> resolves, 2 calls.
++- **network error retried**: bare `Error` (no status) once then ok ->
++  resolves, 2 calls.
++- **exhaustion**: `create` always throws `{status: 503}` -> rejects
++  `TranslationError`, `create` called exactly 3 times.
++- **malformed response not retried**: `create` resolves with
++  `choices: []` -> rejects `TranslationError`, `create` called once.
++- Updated expectations in the two existing fallback tests (bare `Error`
++  is transient -> 3 primary calls before/after fallback).
++
++Gates: `npm run typecheck`, `npm test`.
++
++Manual acceptance: none beyond the automated suite - no live API in the
++loop; behavior verified through injected fakes.
++
++## Risks and notes
++
++- **Double layering.** A transient outage now costs up to 3 in-request
++  attempts x the session's `MAX_TRANSLATION_ATTEMPTS` (3) queued retries
++  = 9 provider calls per segment worst case, plus fallback. Bounded and
++  only on sustained failure; acceptable under BDR-002 but worth knowing.
++- **`Retry-After` ignored.** A 429's `Retry-After` header is not
++  honored; exponential backoff is the v1 answer. Follow-up if providers
++  push longer cooldowns.
++- **Status-less errors assumed transient.** Anything the SDK throws
++  without a numeric `status` is treated as a transport failure. If a
++  provider-specific error class without status should abort, it can be
++  added to `isTransientLlmError` later.
++- **Jitter is symmetric +/-10%** (not full jitter) per the "small random
++  jitter" requirement; with only two sleeps per request the herd risk is
++  already low.
++- **Assist untouched on purpose** - PLAN-009 pinned assist as
++  best-effort single-attempt; if assist later wants the same backoff it
++  imports `withRetry` from `server/translate/retry.ts` directly.
++
++## Definition of Done
++
++- [x] `server/translate/retry.ts` exports `LlmRetryOptions`,
++  `isTransientLlmError`, `withRetry` per the pinned contract; backoff is
++  500ms base doubling with +/-10% jitter, 3 attempts default.
++- [x] `OpenAICompatTranslator` retries transient `create` failures
++  inside `request()` on both primary and fallback; non-transient
++  failures and post-response `TranslationError`s are never retried.
++- [x] Exhaustion propagates the last error through the unchanged
++  `translate()` -> `TranslationError` -> `translateSegment` path.
++- [x] New tests cover 5xx-then-success, 4xx immediate failure,
++  exhaustion after 3 attempts, 429 retry, network-error retry, and
++  malformed-response no-retry; no test hits a real endpoint.
++- [x] `npm run typecheck` and `npm test` pass.
+diff --git a/server/translate/openai-compat.test.ts b/server/translate/openai-compat.test.ts
+index 5dd0549..f69ec75 100644
+--- a/server/translate/openai-compat.test.ts
++++ b/server/translate/openai-compat.test.ts
+@@ -51,21 +51,32 @@ describe('OpenAICompatTranslator', () => {
+     expect(calls).toEqual(['https://p']);
+   });
+ 
++  // Bare Errors carry no HTTP status, so the classifier treats them as
++  // transient transport failures: each endpoint burns its 3 retry
++  // attempts before the chain moves on.
++  const noSleep = { sleep: async () => {} };
++
+   it('retries once on the fallback when the primary errors', async () => {
+     const { calls, factory } = fakeClient({ 'https://p': 'fail', 'https://f': 'ok' });
+     const t = new OpenAICompatTranslator(
+       endpoint('https://p'),
+       endpoint('https://f'),
+       factory,
++      noSleep,
+     );
+     const out = await t.translate(segment, [], 'vi');
+     expect(out).toBe('translated via https://f');
+-    expect(calls).toEqual(['https://p', 'https://f']);
++    expect(calls).toEqual(['https://p', 'https://p', 'https://p', 'https://f']);
+   });
+ 
+   it('throws TranslationError when primary fails and no fallback exists', async () => {
+     const { factory } = fakeClient({ 'https://p': 'fail' });
+-    const t = new OpenAICompatTranslator(endpoint('https://p'), undefined, factory);
++    const t = new OpenAICompatTranslator(
++      endpoint('https://p'),
++      undefined,
++      factory,
++      noSleep,
++    );
+     await expect(t.translate(segment, [], 'vi')).rejects.toBeInstanceOf(
+       TranslationError,
+     );
+@@ -77,11 +88,15 @@ describe('OpenAICompatTranslator', () => {
+       endpoint('https://p'),
+       endpoint('https://f'),
+       factory,
++      noSleep,
+     );
+     await expect(t.translate(segment, [], 'vi')).rejects.toBeInstanceOf(
+       TranslationError,
+     );
+-    expect(calls).toEqual(['https://p', 'https://f']);
++    expect(calls).toEqual([
++      'https://p', 'https://p', 'https://p',
++      'https://f', 'https://f', 'https://f',
++    ]);
+   });
+ 
+   const respondWith = (content: string) =>
+@@ -136,6 +151,126 @@ describe('OpenAICompatTranslator', () => {
+   });
+ });
+ 
++// PLAN-012: transient retry behavior. Each step is a thrown Error (with
++// or without an HTTP status) or a successful completion value.
++describe('OpenAICompatTranslator retries', () => {
++  const segment = { text: 'How are you?' };
++  const noSleep = { sleep: async () => {} };
++
++  function scriptedClient(steps: Array<Error | 'ok'>) {
++    const calls: number[] = [];
++    let i = 0;
++    const factory = () =>
++      ({
++        chat: {
++          completions: {
++            create: async () => {
++              calls.push(i);
++              const step = steps[Math.min(i++, steps.length - 1)];
++              if (step instanceof Error) throw step;
++              return { choices: [{ message: { content: 'translated' } }] };
++            },
++          },
++        },
++      }) as unknown as Pick<OpenAI, 'chat'>;
++    return { calls, factory };
++  }
++
++  const httpError = (status: number) =>
++    Object.assign(new Error(`http ${status}`), { status });
++
++  it('retries a 5xx then succeeds', async () => {
++    const { calls, factory } = scriptedClient([httpError(500), 'ok']);
++    const t = new OpenAICompatTranslator(
++      endpoint('https://p'),
++      undefined,
++      factory,
++      noSleep,
++    );
++    await expect(t.translate(segment, [], 'vi')).resolves.toBe('translated');
++    expect(calls).toHaveLength(2);
++  });
++
++  it('retries a 429 then succeeds', async () => {
++    const { calls, factory } = scriptedClient([httpError(429), 'ok']);
++    const t = new OpenAICompatTranslator(
++      endpoint('https://p'),
++      undefined,
++      factory,
++      noSleep,
++    );
++    await expect(t.translate(segment, [], 'vi')).resolves.toBe('translated');
++    expect(calls).toHaveLength(2);
++  });
++
++  it('retries a network error with no status then succeeds', async () => {
++    const { calls, factory } = scriptedClient([new Error('socket hang up'), 'ok']);
++    const t = new OpenAICompatTranslator(
++      endpoint('https://p'),
++      undefined,
++      factory,
++      noSleep,
++    );
++    await expect(t.translate(segment, [], 'vi')).resolves.toBe('translated');
++    expect(calls).toHaveLength(2);
++  });
++
++  it('fails immediately on other 4xx without retrying', async () => {
++    const { calls, factory } = scriptedClient([httpError(400), 'ok']);
++    const t = new OpenAICompatTranslator(
++      endpoint('https://p'),
++      undefined,
++      factory,
++      noSleep,
++    );
++    await expect(t.translate(segment, [], 'vi')).rejects.toBeInstanceOf(
++      TranslationError,
++    );
++    expect(calls).toHaveLength(1);
++  });
++
++  it('exhausts after 3 attempts and rejects', async () => {
++    const { calls, factory } = scriptedClient([
++      httpError(503), httpError(500), httpError(503), 'ok',
++    ]);
++    const t = new OpenAICompatTranslator(
++      endpoint('https://p'),
++      undefined,
++      factory,
++      noSleep,
++    );
++    await expect(t.translate(segment, [], 'vi')).rejects.toBeInstanceOf(
++      TranslationError,
++    );
++    expect(calls).toHaveLength(3);
++  });
++
++  it('does not retry a malformed (empty) response', async () => {
++    const calls: number[] = [];
++    const factory = () =>
++      ({
++        chat: {
++          completions: {
++            create: async () => {
++              calls.push(1);
++              return { choices: [] };
++            },
++          },
++        },
++      }) as unknown as Pick<OpenAI, 'chat'>;
++    const t = new OpenAICompatTranslator(
++      endpoint('https://p'),
++      undefined,
++      factory,
++      noSleep,
++    );
++    await expect(t.translate(segment, [], 'vi')).rejects.toBeInstanceOf(
++      TranslationError,
++    );
++    expect(calls).toHaveLength(1);
++  });
++});
++
+ describe('renderPrompt', () => {
+   it('labels the segment and context with speakers and target language', () => {
+     const out = renderPrompt(
+diff --git a/server/translate/openai-compat.ts b/server/translate/openai-compat.ts
+index 3b05342..bbe6d85 100644
+--- a/server/translate/openai-compat.ts
++++ b/server/translate/openai-compat.ts
+@@ -1,5 +1,6 @@
+ import OpenAI from 'openai';
+ import type { Config } from '../config.js';
++import { isTransientLlmError, withRetry, type LlmRetryOptions } from './retry.js';
+ import {
+   TranslationError,
+   type Translatable,
+@@ -34,6 +35,7 @@ export class OpenAICompatTranslator implements Translator {
+     private readonly primary: LLMEndpoint,
+     private readonly fallback: LLMEndpoint | undefined,
+     private readonly clientFactory: ClientFactory = defaultClientFactory,
++    private readonly retry: LlmRetryOptions = {},
+   ) {}
+ 
+   async translate(
+@@ -84,8 +86,15 @@ export class OpenAICompatTranslator implements Translator {
+       temperature: 0.2,
+       ...endpoint.extraBody,
+     };
+-    const res = (await client.chat.completions.create(
+-      body as never,
++    // PLAN-012: retry only the request; post-response TranslationErrors
++    // stay outside this boundary and never re-enter the loop.
++    const res = (await withRetry(
++      () =>
++        client.chat.completions.create(
++          body as never,
++        ) as Promise<OpenAI.ChatCompletion>,
++      isTransientLlmError,
++      this.retry,
+     )) as OpenAI.ChatCompletion;
+     const text = res.choices[0]?.message?.content?.trim();
+     const cleaned = text ? stripSpeakerLabel(text, segment.speaker) : '';
+diff --git a/server/translate/retry.test.ts b/server/translate/retry.test.ts
+new file mode 100644
+index 0000000..92f6964
+--- /dev/null
++++ b/server/translate/retry.test.ts
+@@ -0,0 +1,122 @@
++import { describe, expect, it } from 'vitest';
++import { isTransientLlmError, withRetry, type LlmRetryOptions } from './retry.js';
++
++const noSleep = () => Promise.resolve();
++
++function trackingSleep() {
++  const delays: number[] = [];
++  const sleep = async (ms: number) => {
++    delays.push(ms);
++  };
++  return { delays, sleep };
++}
++
++describe('isTransientLlmError', () => {
++  it('treats 429 and 5xx as transient', () => {
++    expect(isTransientLlmError({ status: 429 })).toBe(true);
++    expect(isTransientLlmError({ status: 500 })).toBe(true);
++    expect(isTransientLlmError({ status: 503 })).toBe(true);
++  });
++
++  it('treats other statuses as non-transient', () => {
++    expect(isTransientLlmError({ status: 400 })).toBe(false);
++    expect(isTransientLlmError({ status: 401 })).toBe(false);
++    expect(isTransientLlmError({ status: 404 })).toBe(false);
++    expect(isTransientLlmError({ status: 200 })).toBe(false);
++  });
++
++  it('treats failures without a numeric status as transient (network)', () => {
++    expect(isTransientLlmError(new Error('socket hang up'))).toBe(true);
++    expect(isTransientLlmError({ status: undefined })).toBe(true);
++    expect(isTransientLlmError({ status: '500' })).toBe(true);
++  });
++});
++
++describe('withRetry', () => {
++  const options = (extra?: LlmRetryOptions): LlmRetryOptions => ({
++    sleep: noSleep,
++    ...extra,
++  });
++
++  it('resolves on first success without sleeping', async () => {
++    const { delays, sleep } = trackingSleep();
++    let calls = 0;
++    const out = await withRetry(
++      async () => {
++        calls++;
++        return 'ok';
++      },
++      isTransientLlmError,
++      { sleep },
++    );
++    expect(out).toBe('ok');
++    expect(calls).toBe(1);
++    expect(delays).toEqual([]);
++  });
++
++  it('retries a transient failure then succeeds with doubling delays', async () => {
++    const { delays, sleep } = trackingSleep();
++    let calls = 0;
++    const out = await withRetry(
++      async () => {
++        calls++;
++        if (calls <= 2) throw Object.assign(new Error('bad'), { status: 500 });
++        return 'ok';
++      },
++      isTransientLlmError,
++      { sleep, random: () => 0.5 },
++    );
++    expect(out).toBe('ok');
++    expect(calls).toBe(3);
++    expect(delays).toEqual([500, 1000]);
++  });
++
++  it('rethrows non-retryable failures immediately', async () => {
++    const { delays, sleep } = trackingSleep();
++    const err = Object.assign(new Error('nope'), { status: 400 });
++    let calls = 0;
++    await expect(
++      withRetry(
++        async () => {
++          calls++;
++          throw err;
++        },
++        isTransientLlmError,
++        { sleep },
++      ),
++    ).rejects.toBe(err);
++    expect(calls).toBe(1);
++    expect(delays).toEqual([]);
++  });
++
++  it('exhausts after the configured attempts and rethrows the last error', async () => {
++    const last = Object.assign(new Error('last'), { status: 503 });
++    let calls = 0;
++    await expect(
++      withRetry(
++        async () => {
++          calls++;
++          throw calls === 3 ? last : Object.assign(new Error('x'), { status: 500 });
++        },
++        isTransientLlmError,
++        options({ attempts: 3 }),
++      ),
++    ).rejects.toBe(last);
++    expect(calls).toBe(3);
++  });
++
++  it('never retries with attempts: 1', async () => {
++    let calls = 0;
++    await expect(
++      withRetry(
++        async () => {
++          calls++;
++          throw Object.assign(new Error('x'), { status: 500 });
++        },
++        isTransientLlmError,
++        options({ attempts: 1 }),
++      ),
++    ).rejects.toThrow('x');
++    expect(calls).toBe(1);
++  });
++});
+diff --git a/server/translate/retry.ts b/server/translate/retry.ts
+new file mode 100644
+index 0000000..b6b8760
+--- /dev/null
++++ b/server/translate/retry.ts
+@@ -0,0 +1,54 @@
++// Transient-failure retry for LLM endpoint calls (PLAN-012). Wraps only
++// the request itself - errors raised while handling a resolved response
++// never enter this boundary, so malformed responses fail immediately.
++
++export interface LlmRetryOptions {
++  /** Total attempts including the first call. Default 3. */
++  attempts?: number;
++  /** Base backoff delay in ms. Default 500. */
++  baseDelayMs?: number;
++  /** Injectable for tests; defaults to setTimeout-based sleep. */
++  sleep?: (ms: number) => Promise<void>;
++  /** Injectable for tests; defaults to Math.random. */
++  random?: () => number;
++}
++
++const DEFAULT_ATTEMPTS = 3;
++const DEFAULT_BASE_DELAY_MS = 500;
++
++// Transient = HTTP 429/5xx, or a failure with no HTTP status at all.
++// The openai SDK puts a numeric status on APIError; connection and
++// timeout errors (APIConnectionError family, ECONNRESET, ENOTFOUND,
++// undici "fetch failed") reject without one.
++export function isTransientLlmError(err: unknown): boolean {
++  const status = readStatus(err);
++  return status == null || status === 429 || status >= 500;
++}
++
++function readStatus(err: unknown): number | undefined {
++  if (typeof err !== 'object' || err === null) return undefined;
++  const status = (err as { status?: unknown }).status;
++  return typeof status === 'number' ? status : undefined;
++}
++
++export async function withRetry<T>(
++  fn: () => Promise<T>,
++  isRetryable: (err: unknown) => boolean,
++  options: LlmRetryOptions = {},
++): Promise<T> {
++  const attempts = Math.max(1, options.attempts ?? DEFAULT_ATTEMPTS);
++  const baseDelayMs = options.baseDelayMs ?? DEFAULT_BASE_DELAY_MS;
++  const sleep =
++    options.sleep ??
++    ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
++  const random = options.random ?? Math.random;
++  for (let attempt = 1; ; attempt++) {
++    try {
++      return await fn();
++    } catch (err) {
++      if (attempt >= attempts || !isRetryable(err)) throw err;
++      const delay = baseDelayMs * 2 ** (attempt - 1) * (0.9 + 0.2 * random());
++      await sleep(delay);
++    }
++  }
++}
+-- 
+2.50.0
+
+
+From 78111874b33bb0d89947830e4e6645957b98b6e4 Mon Sep 17 00:00:00 2001
+From: Satoshi Man <mrvuong.bitcoin@gmail.com>
+Date: Thu, 5 Nov 2026 19:51:13 +0700
+Subject: [PATCH 2/2] log: transient LLM retry with exponential backoff
+
+---
+ CONTEXTS/04-logs/2026-11-05.md | 42 ++++++++++++++++++++++++++++++++--
+ 1 file changed, 40 insertions(+), 2 deletions(-)
+
+diff --git a/CONTEXTS/04-logs/2026-11-05.md b/CONTEXTS/04-logs/2026-11-05.md
+index a251d67..50f5688 100644
+--- a/CONTEXTS/04-logs/2026-11-05.md
++++ b/CONTEXTS/04-logs/2026-11-05.md
+@@ -1,11 +1,11 @@
+ ---
+ date: "2026-11-05"
+-events_count: 88
++events_count: 89
+ ---
+ 
+ # Events on 2026-11-05
+ 
+-Total events: **88**
++Total events: **89**
+ 
+ ## Table of contents
+ 
+@@ -97,6 +97,7 @@ Total events: **88**
+ - [17:56 - Add README and MIT license](#1756---add-readme-and-mit-license)
+ - [17:58 - Update license copyright to real name](#1758---update-license-copyright-to-real-name)
+ - [18:31 - Standardize workflow name in README](#1831---standardize-workflow-name-in-readme)
++- [19:51 - Transient LLM retry with exponential backoff (PLAN-012)](#1951---transient-llm-retry-with-exponential-backoff-plan-012)
+ 
+ ---
+ 
+@@ -3124,3 +3125,40 @@ README.md
+ None
+ 
+ ---
++## 19:51 - Transient LLM retry with exponential backoff (PLAN-012)
++
++**Scope:** server/translate | **Type:** Feature | **Commit:** 14c7f52 @ doc-centric
++
++## Scope
++server/translate
++
++## Type
++Feature
++
++## Commit
++- **Hash:** 14c7f52
++- **Repo:** doc-centric
++- **Message:** Retry transient LLM failures with exponential backoff (PLAN-012)
++- **Author:** Satoshi Man <mrvuong.bitcoin@gmail.com>
++- **Date:** 2026-11-05 19:51:00 +0700
++
++## User request
++Add retry with exponential backoff for translation API calls: transient failures only (network, 5xx, 429), 500ms base doubling up to 3 attempts with jitter, immediate failure on other 4xx and malformed responses, same error path on exhaustion, tests must not hit the real API. Done when npm test and npm run typecheck pass.
++
++## Reason
++Transient provider blips previously burned the single primary->fallback hop and the session-level queued retry. In-request exponential backoff (PLAN-012, verified against ADR-003/BDR-002, review_count 1) absorbs them cheaply; exhaustion still surfaces as TranslationError through translateSegment unchanged.
++
++## Description
++Added withRetry + isTransientLlmError in server/translate/retry.ts and wrapped chat.completions.create in OpenAICompatTranslator.request. Retryable: HTTP 429/5xx and status-less transport failures; other 4xx and post-response TranslationErrors fail immediately. Backoff: 500ms base doubling, +/-10% jitter, 3 attempts per endpoint (primary then fallback chain unchanged per ADR-003). New retry.test.ts plus translator-level tests for 5xx/429/network retry, 4xx immediate failure, 3-attempt exhaustion, and malformed-response no-retry.
++
++## Files changed
++server/translate/retry.ts
++server/translate/retry.test.ts
++server/translate/openai-compat.ts
++server/translate/openai-compat.test.ts
++CONTEXTS/03-implement-plan/PLAN-012-llm-transient-retry.md
++
++## Notes
++Retry-After header not honored; assist path intentionally untouched (PLAN-009 pinned best-effort single attempt); worst case 3x3 plus fallback provider calls per segment under sustained outage.
++
++---
+-- 
+2.50.0
+

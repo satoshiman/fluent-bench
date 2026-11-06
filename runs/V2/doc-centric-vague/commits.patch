@@ -1,0 +1,988 @@
+From 851b18631bb728263d9e358b4b25b8b3dd3b7033 Mon Sep 17 00:00:00 2001
+From: Satoshi Man <mrvuong.bitcoin@gmail.com>
+Date: Thu, 5 Nov 2026 22:50:21 +0700
+Subject: [PATCH 1/6] docs: draft PLAN-012 retry transient translation request
+ failures
+
+---
+ .../PLAN-012-translation-request-retry.md     | 257 ++++++++++++++++++
+ 1 file changed, 257 insertions(+)
+ create mode 100644 CONTEXTS/03-implement-plan/PLAN-012-translation-request-retry.md
+
+diff --git a/CONTEXTS/03-implement-plan/PLAN-012-translation-request-retry.md b/CONTEXTS/03-implement-plan/PLAN-012-translation-request-retry.md
+new file mode 100644
+index 0000000..cddf728
+--- /dev/null
++++ b/CONTEXTS/03-implement-plan/PLAN-012-translation-request-retry.md
+@@ -0,0 +1,257 @@
++---
++id: PLAN-012-translation-request-retry
++status: draft
++date: 2026-11-05
++review_count: 0
++patch: n/a
++---
++
++# PLAN-012: Retry transient failures inside the translation request
++
++## Status
++
++draft
++
++## Context
++
++The user reports that "the translation call sometimes dies on
++network errors" and asks for retry behavior.
++
++Current behavior: `OpenAICompatTranslator.request()`
++(`server/translate/openai-compat.ts`) issues exactly one
++`chat.completions.create` per endpoint. The shared
++`defaultClientFactory` builds the SDK client with `maxRetries: 0`,
++so any transient transport failure (connection reset, DNS blip,
++socket timeout, gateway 502/503) immediately throws. `translate()`
++then escalates to the fallback endpoint (one attempt there, also
++unprotected), and when that fails the whole call throws
++`TranslationError`. `SessionManager.translateSegment` retries the
++whole `translate()` up to `MAX_TRANSLATION_ATTEMPTS = 3` with
++`RETRY_DELAY_MS * attempt` (5 s linear) backoff, but each outer
++attempt re-traverses primary-then-fallback and still dies on the
++first transient error per endpoint.
++
++The result: a momentary network blip either lands on the wrong
++provider (fallback output for a primary that was actually fine) or
++consumes one of the three outer attempts for no real reason.
++
++## Governing records
++
++- BDR-001: realtime aid during meetings; added retry delay must be
++  bounded so translated segments still land within a few seconds.
++  Worst-case added latency is ~1.1 s per endpoint (see Design).
++- BDR-002: cost ceiling; retries only fire on failure paths, never
++  on success, so spend is unchanged in the common case and bounded
++  (max +2 extra calls per endpoint) in the failure case.
++- ADR-003: primary-then-single-fallback semantics are preserved.
++  Retries happen *inside* each endpoint attempt, before escalation;
++  the fallback is still reached once per `translate()` call. The
++  "transcript is never blocked by translation" guarantee is
++  untouched (`translateSegment` stays fire-and-forget).
++- ADR-005: no new env vars; the retry policy is a code constant.
++  Env-based config stays limited to endpoints, models, and keys.
++- ADR-006: no new dependencies; the `openai` SDK (7.45.1) already
++  exposes the error classes used for classification.
++
++## Scope
++
++In scope:
++
++1. A retry wrapper inside `OpenAICompatTranslator.request()` that
++   re-issues `chat.completions.create` on transient failures, with
++   exponential backoff + jitter, applied identically to the primary
++   and the fallback endpoint.
++2. A pinned classification of retryable vs non-retryable errors.
++3. Unit tests covering retry success, exhaustion, and fast-fail
++   classification.
++
++Out of scope:
++
++- The answer-assist path (`server/assist/openai-compat.ts`). It
++  shares `defaultClientFactory` but is explicitly best-effort per
++  PLAN-009; reusing the retry helper there is a follow-up, not this
++  plan.
++- The outer `translateSegment` retry loop in `SessionManager`
++  (`MAX_TRANSLATION_ATTEMPTS`/`RETRY_DELAY_MS`) - unchanged.
++- Retrying an empty/label-only translation response
++  (`TranslationError('empty translation response')`): that is a
++  semantic failure, not transport; it keeps escalating to fallback
++  exactly as today.
++- New env vars, config schema changes, `.env.example` edits, UI
++  changes.
++
++## Design decisions (pinned)
++
++**Retry policy contract** (`server/translate/openai-compat.ts`):
++
++```ts
++export interface RetryPolicy {
++  attempts: number; // total tries per endpoint, minimum 1
++  baseDelayMs: number;
++  maxDelayMs: number;
++  sleep?: (ms: number) => Promise<void>;
++}
++
++export const DEFAULT_RETRY_POLICY: RetryPolicy = {
++  attempts: 3,
++  baseDelayMs: 250,
++  maxDelayMs: 2_000,
++};
++
++export function isRetryableTranslationError(err: unknown): boolean
++```
++
++`RetryPolicy` is exported (like `renderPrompt` /
++`stripSpeakerLabel`) so tests inject a zero-delay policy and assert
++call counts deterministically; production code always uses
++`DEFAULT_RETRY_POLICY`. `sleep` defaults to a
++`new Promise((r) => setTimeout(r, ms))` timer when omitted.
++
++**Classification** (`isRetryableTranslationError`):
++
++- Retryable:
++  - `OpenAI.APIConnectionError` (covers `APIConnectionTimeoutError`
++    and the SDK's wrapping of undici/fetch transport failures:
++    ECONNRESET, ENOTFOUND, socket hangups, aborted requests)
++  - `OpenAI.APIError` with `status` of 408, 409, or 429, or any
++    `status >= 500` (covers `RateLimitError`,
++    `InternalServerError`, gateway errors)
++  - any thrown value that is neither an `OpenAI.APIError` nor a
++    `TranslationError` - assumed transport-layer noise and treated
++    as transient
++- Non-retryable:
++  - `OpenAI.APIError` with any other status (400, 401, 403, 404,
++    422 - bad key, bad request, model not found): fail fast to the
++    fallback exactly as today
++  - `TranslationError` (empty translation response)
++
++**Retry loop** (described, not pasted): `request()` wraps the
++`client.chat.completions.create(body)` call in a loop over
++`attempt = 1..policy.attempts`. On a caught error: if
++`attempt === policy.attempts` or the error is non-retryable,
++rethrow; otherwise `await sleep(delay(attempt))` and loop, where
++`delay(n) = min(maxDelayMs, baseDelayMs * 2^(n-1))` multiplied by a
++jitter factor `0.5 + Math.random() * 0.5` (50-100% of the computed
++delay). The request body is rebuilt once before the loop; each
++retry re-issues the identical request. Worst case per endpoint with
++the default policy: delays of ~250 ms and ~500 ms (+jitter), i.e.
++under ~1.1 s added before escalating to fallback.
++
++**Constructor wiring:** `OpenAICompatTranslator` gains a 4th
++constructor parameter
++`retryPolicy: RetryPolicy = DEFAULT_RETRY_POLICY`, stored and used
++by `request()`. `makeTranslator(config, clientFactory?)` keeps its
++current signature and relies on the default; tests construct the
++translator directly with a custom policy.
++
++**Rejected alternative - SDK `maxRetries`:** bumping
++`maxRetries: 0` on the SDK client would retry transport errors for
++free, but (a) it cannot be exercised by the existing
++fake-`ClientFactory` tests since the fake never goes through real
++HTTP, (b) its delay/status policy is SDK-internal and not
++observable, and (c) `defaultClientFactory` is shared with the
++assist client, where retry semantics should be a separate decision.
++The explicit loop keeps the behavior visible, testable, and scoped
++to translation.
++
++## Steps
++
++### Step 1 - `server/translate/openai-compat.ts`
++
++- Add `RetryPolicy`, `DEFAULT_RETRY_POLICY`,
++  `isRetryableTranslationError`, and a module-level `sleep` helper
++  per the pinned contract.
++- Add the `retryPolicy` constructor parameter (4th, defaulted).
++- Wrap the `chat.completions.create` call in `request()` with the
++  retry loop described above. No other changes to `request()`:
++  prompt rendering, `extraBody`, `stripSpeakerLabel`, and the
++  empty-response `TranslationError` are untouched.
++- `translate()`'s primary/fallback structure and the two
++  `TranslationError` message strings are unchanged.
++
++### Step 2 - `server/translate/openai-compat.test.ts`
++
++Add cases using the existing `fakeClient` pattern plus error
++factories for the SDK error classes:
++
++- primary succeeds on the 2nd try after an `APIConnectionError`:
++  calls `['https://p', 'https://p']`, returns the success text.
++- retries exhausted then escalates to fallback: primary throws
++  `APIConnectionError` every time, fallback ok: calls
++  `['https://p' x3, 'https://f']`.
++- non-retryable error (e.g. `APIError` with status 401) fails fast:
++  calls `['https://p', 'https://f']`, no same-endpoint retry.
++- `APIError` with status 500 and status 429 are each retried.
++- a plain `TypeError` (simulating unwrapped transport noise) is
++  retried.
++- empty-response `TranslationError` is not retried on the same
++  endpoint (existing label-only test already asserts the throw;
++  extend or add a calls assertion of `['https://p']` before
++  fallback/`TranslationError`).
++- `isRetryableTranslationError` direct unit cases for the
++  classification table above.
++
++All new tests inject `retryPolicy = { attempts: 3, baseDelayMs: 0,
++maxDelayMs: 0, sleep: async () => {} }` so no real timers run.
++
++## Test plan
++
++Automated (vitest, existing patterns):
++
++- `server/translate/openai-compat.test.ts`: the cases in Step 2.
++- Gates: `npm run typecheck`, `npm test`,
++  `npm --prefix web run build`, `npm --prefix web run lint`.
++
++Manual acceptance:
++
++- With a session running, briefly sever the network (or point
++  `LLM_BASE_URL` at a port that drops connections): translated
++  segments still land within a few seconds once connectivity
++  returns, without emitting `TRANSLATION_FAILED` toasts.
++- With a valid primary and an invalid `LLM_API_KEY` (401): the
++  fallback still engages immediately, with no visible stall from
++  pointless retries.
++
++## Risks and notes
++
++- **Assumption (no clarification round per task instructions):**
++  "the translation call" means the LLM request in
++  `OpenAICompatTranslator.request()` - the only network call in the
++  translation path. If the user instead meant the WebSocket or the
++  STT stream, this plan does not address it.
++- **Duplicate billing edge:** if a request succeeds server-side but
++  the response is lost in transit, a retry issues a second
++  completion. Cost is cents-scale (BDR-002) and the deduplicated
++  result is identical in intent; accepted.
++- **429 handling:** the retry honors a fixed backoff, not the
++  provider's `Retry-After` header. DeepSeek/OpenAI rate limits are
++  rarely hit at this volume; reading `Retry-After` is a follow-up
++  if it ever bites.
++- **Exact SDK error constructors** (`new OpenAI.APIError(...)`,
++  `new OpenAI.APIConnectionError(...)`) differ across openai major
++  versions; the implementer must check the installed
++  `openai@7.45.1` typings when writing test error factories.
++- **No logging on retry:** the translator has no logger dependency
++  and stays that way; failures that survive retries surface through
++  the existing `SessionManager` warn log and `TRANSLATION_FAILED`
++  event. Adding retry diagnostics is a follow-up if needed.
++- **Assist follow-up:** `OpenAICompatAssistant` can adopt the same
++  `RetryPolicy`/`isRetryableTranslationError` helper later; kept
++  out of scope to keep this diff small.
++
++## Definition of Done
++
++- [ ] `RetryPolicy`, `DEFAULT_RETRY_POLICY`,
++  `isRetryableTranslationError` exist in
++  `server/translate/openai-compat.ts` with the pinned
++  classification.
++- [ ] `request()` retries transient errors per endpoint with
++  bounded exponential backoff + jitter; non-retryable errors and
++  `TranslationError` escalate immediately.
++- [ ] Primary/fallback ordering and `TranslationError` messages are
++  unchanged; `makeTranslator` signature is unchanged.
++- [ ] New unit tests cover retry-success, exhaustion-to-fallback,
++  fast-fail 4xx, 5xx/429 retry, unknown-error retry, and the
++  classification function; all run with zero real delay.
++- [ ] `npm run typecheck`, `npm test`, `npm --prefix web run
++  build`, `npm --prefix web run lint` clean.
+-- 
+2.50.0
+
+
+From 465567d8d56a4401879e3925b148a86aef137c12 Mon Sep 17 00:00:00 2001
+From: Satoshi Man <mrvuong.bitcoin@gmail.com>
+Date: Thu, 5 Nov 2026 22:50:28 +0700
+Subject: [PATCH 2/6] log: event for PLAN-012 draft
+
+---
+ CONTEXTS/04-logs/2026-11-05.md | 38 ++++++++++++++++++++++++++++++++--
+ 1 file changed, 36 insertions(+), 2 deletions(-)
+
+diff --git a/CONTEXTS/04-logs/2026-11-05.md b/CONTEXTS/04-logs/2026-11-05.md
+index a251d67..df3ab52 100644
+--- a/CONTEXTS/04-logs/2026-11-05.md
++++ b/CONTEXTS/04-logs/2026-11-05.md
+@@ -1,11 +1,11 @@
+ ---
+ date: "2026-11-05"
+-events_count: 88
++events_count: 89
+ ---
+ 
+ # Events on 2026-11-05
+ 
+-Total events: **88**
++Total events: **89**
+ 
+ ## Table of contents
+ 
+@@ -97,6 +97,7 @@ Total events: **88**
+ - [17:56 - Add README and MIT license](#1756---add-readme-and-mit-license)
+ - [17:58 - Update license copyright to real name](#1758---update-license-copyright-to-real-name)
+ - [18:31 - Standardize workflow name in README](#1831---standardize-workflow-name-in-readme)
++- [22:50 - Draft PLAN-012: retry transient translation request failures](#2250---draft-plan-012-retry-transient-translation-request-failures)
+ 
+ ---
+ 
+@@ -3124,3 +3125,36 @@ README.md
+ None
+ 
+ ---
++## 22:50 - Draft PLAN-012: retry transient translation request failures
++
++**Scope:** CONTEXTS/03-implement-plan | **Type:** Docs | **Commit:** 851b186 @ doc-centric-vague
++
++## Scope
++CONTEXTS/03-implement-plan
++
++## Type
++Docs
++
++## Commit
++- **Hash:** 851b186
++- **Repo:** doc-centric-vague
++- **Message:** docs: draft PLAN-012 retry transient translation request failures
++- **Author:** Satoshi Man <mrvuong.bitcoin@gmail.com>
++- **Date:** 2026-11-05 22:50:21 +0700
++
++## User request
++The translation call sometimes dies on network errors, make it retry; draft only the plan, no implementation.
++
++## Reason
++Single-attempt-per-endpoint LLM calls die on transient network blips and waste the coarse outer retry; an explicit per-endpoint retry loop preserves ADR-003 primary/fallback semantics while absorbing transport noise.
++
++## Description
++Drafted implementation plan for bounded retry with exponential backoff and jitter inside OpenAICompatTranslator.request(). Retryable: APIConnectionError family, APIError 408/409/429/5xx, unknown transport errors. Non-retryable: other 4xx APIError and TranslationError. Default policy 3 attempts per endpoint, 250ms base, 2s cap; injectable RetryPolicy for tests. Primary/fallback ordering and outer SessionManager retry unchanged.
++
++## Files changed
++CONTEXTS/03-implement-plan/PLAN-012-translation-request-retry.md
++
++## Notes
++Plan is draft (review_count 0, patch n/a); implementation gated on developer review per AGENTS.md. Assist retry left as follow-up.
++
++---
+-- 
+2.50.0
+
+
+From 0b99cd587f378d1fad46309b2c84d66578ec701e Mon Sep 17 00:00:00 2001
+From: Satoshi Man <mrvuong.bitcoin@gmail.com>
+Date: Thu, 5 Nov 2026 22:53:39 +0700
+Subject: [PATCH 3/6] docs: verification pass 1 on PLAN-012, patch divergences
+
+---
+ .../PLAN-012-translation-request-retry.md     | 44 +++++++++++++++----
+ 1 file changed, 35 insertions(+), 9 deletions(-)
+
+diff --git a/CONTEXTS/03-implement-plan/PLAN-012-translation-request-retry.md b/CONTEXTS/03-implement-plan/PLAN-012-translation-request-retry.md
+index cddf728..f7fc071 100644
+--- a/CONTEXTS/03-implement-plan/PLAN-012-translation-request-retry.md
++++ b/CONTEXTS/03-implement-plan/PLAN-012-translation-request-retry.md
+@@ -2,8 +2,8 @@
+ id: PLAN-012-translation-request-retry
+ status: draft
+ date: 2026-11-05
+-review_count: 0
+-patch: n/a
++review_count: 1
++patch: applied
+ ---
+ 
+ # PLAN-012: Retry transient failures inside the translation request
+@@ -112,7 +112,7 @@ call counts deterministically; production code always uses
+ - Retryable:
+   - `OpenAI.APIConnectionError` (covers `APIConnectionTimeoutError`
+     and the SDK's wrapping of undici/fetch transport failures:
+-    ECONNRESET, ENOTFOUND, socket hangups, aborted requests)
++    ECONNRESET, ENOTFOUND, socket hangups, socket aborts)
+   - `OpenAI.APIError` with `status` of 408, 409, or 429, or any
+     `status >= 500` (covers `RateLimitError`,
+     `InternalServerError`, gateway errors)
+@@ -125,6 +125,15 @@ call counts deterministically; production code always uses
+     fallback exactly as today
+   - `TranslationError` (empty translation response)
+ 
++Check order matters: `APIConnectionError` is an `APIError`
++subclass with `status: undefined`, so the connection-error test
++must run before the generic `APIError` status test - otherwise
++every transport failure lands in the non-retryable branch.
++`APIUserAbortError` also carries `status: undefined` and correctly
++falls to non-retryable (a deliberate abort is never retried); it
++cannot occur here anyway because `request()` passes no abort
++signal.
++
+ **Retry loop** (described, not pasted): `request()` wraps the
+ `client.chat.completions.create(body)` call in a loop over
+ `attempt = 1..policy.attempts`. On a caught error: if
+@@ -171,8 +180,18 @@ to translation.
+ 
+ ### Step 2 - `server/translate/openai-compat.test.ts`
+ 
+-Add cases using the existing `fakeClient` pattern plus error
+-factories for the SDK error classes:
++Existing `fakeClient` updates (required to keep the suite green):
++the fake's `fail` outcome currently throws a plain `Error`, which
++the new classification treats as retryable - it must instead throw
++a non-retryable `OpenAI.APIError` (status 401) so the pre-existing
++`['https://p', 'https://f']` expectations stay valid and no real
++sleeps run. The fake also needs a per-call outcome queue (for
++example fail-then-ok on one URL) so "succeeds on the 2nd try" can
++be expressed; the current one-outcome-per-URL `behavior` map
++cannot.
++
++Add cases using the updated `fakeClient` plus error factories for
++the SDK error classes:
+ 
+ - primary succeeds on the 2nd try after an `APIConnectionError`:
+   calls `['https://p', 'https://p']`, returns the success text.
+@@ -227,10 +246,14 @@ Manual acceptance:
+   provider's `Retry-After` header. DeepSeek/OpenAI rate limits are
+   rarely hit at this volume; reading `Retry-After` is a follow-up
+   if it ever bites.
+-- **Exact SDK error constructors** (`new OpenAI.APIError(...)`,
+-  `new OpenAI.APIConnectionError(...)`) differ across openai major
+-  versions; the implementer must check the installed
+-  `openai@7.45.1` typings when writing test error factories.
++- **SDK error constructors** (verified against `openai@7.45.1`
++  typings in `node_modules/openai/core/error.d.ts`):
++  `APIError(status, error, message, headers)` takes positional
++  args; `APIError.generate(status, errorResponse, message,
++  headers)` returns the matching subclass; `APIConnectionError`
++  takes `{ message?, cause? }`, `APIConnectionTimeoutError` takes
++  `{ message? }`; fixed-status subclasses like `RateLimitError`
++  inherit the `APIError` constructor.
+ - **No logging on retry:** the translator has no logger dependency
+   and stays that way; failures that survive retries surface through
+   the existing `SessionManager` warn log and `TRANSLATION_FAILED`
+@@ -253,5 +276,8 @@ Manual acceptance:
+ - [ ] New unit tests cover retry-success, exhaustion-to-fallback,
+   fast-fail 4xx, 5xx/429 retry, unknown-error retry, and the
+   classification function; all run with zero real delay.
++- [ ] Pre-existing `fakeClient` tests keep their call expectations
++  unchanged (the fake's `fail` outcome throws a non-retryable
++  `APIError`).
+ - [ ] `npm run typecheck`, `npm test`, `npm --prefix web run
+   build`, `npm --prefix web run lint` clean.
+-- 
+2.50.0
+
+
+From bc17e9ebfcc8ebf1dde8a85ee6060c56b868c587 Mon Sep 17 00:00:00 2001
+From: Satoshi Man <mrvuong.bitcoin@gmail.com>
+Date: Thu, 5 Nov 2026 22:53:52 +0700
+Subject: [PATCH 4/6] log: event for PLAN-012 verification pass
+
+---
+ CONTEXTS/04-logs/2026-11-05.md | 38 ++++++++++++++++++++++++++++++++--
+ 1 file changed, 36 insertions(+), 2 deletions(-)
+
+diff --git a/CONTEXTS/04-logs/2026-11-05.md b/CONTEXTS/04-logs/2026-11-05.md
+index df3ab52..f6c09c8 100644
+--- a/CONTEXTS/04-logs/2026-11-05.md
++++ b/CONTEXTS/04-logs/2026-11-05.md
+@@ -1,11 +1,11 @@
+ ---
+ date: "2026-11-05"
+-events_count: 89
++events_count: 90
+ ---
+ 
+ # Events on 2026-11-05
+ 
+-Total events: **89**
++Total events: **90**
+ 
+ ## Table of contents
+ 
+@@ -98,6 +98,7 @@ Total events: **89**
+ - [17:58 - Update license copyright to real name](#1758---update-license-copyright-to-real-name)
+ - [18:31 - Standardize workflow name in README](#1831---standardize-workflow-name-in-readme)
+ - [22:50 - Draft PLAN-012: retry transient translation request failures](#2250---draft-plan-012-retry-transient-translation-request-failures)
++- [22:53 - Verification pass 1 on PLAN-012](#2253---verification-pass-1-on-plan-012)
+ 
+ ---
+ 
+@@ -3158,3 +3159,36 @@ CONTEXTS/03-implement-plan/PLAN-012-translation-request-retry.md
+ Plan is draft (review_count 0, patch n/a); implementation gated on developer review per AGENTS.md. Assist retry left as follow-up.
+ 
+ ---
++## 22:53 - Verification pass 1 on PLAN-012
++
++**Scope:** CONTEXTS/03-implement-plan | **Type:** Docs | **Commit:** 0b99cd5 @ doc-centric-vague
++
++## Scope
++CONTEXTS/03-implement-plan
++
++## Type
++Docs
++
++## Commit
++- **Hash:** 0b99cd5
++- **Repo:** doc-centric-vague
++- **Message:** docs: verification pass 1 on PLAN-012, patch divergences
++- **Author:** Satoshi Man <mrvuong.bitcoin@gmail.com>
++- **Date:** 2026-11-05 22:53:39 +0700
++
++## User request
++Run ONE verification pass on the newest PLAN per AGENTS.md: re-check against BDRs, ADRs, codebase; patch divergences; update review_count and patch; do not implement; commit only plan changes.
++
++## Reason
++AGENTS.md verification loop requires at least one review pass before implementation; review found test-suite and classification-ordering divergences that were cheaper to patch in the plan than in code.
++
++## Description
++Re-checked PLAN-012 (retry transient translation request failures) against BDRs, ADRs, and the codebase. Patched three divergences: (1) existing fakeClient 'fail' throws a plain Error which the new classification treats as retryable, breaking the pre-existing ['https://p','https://f'] call expectations and adding real sleeps - the plan now pins fail as a non-retryable APIError(401) plus a per-call outcome queue; (2) pinned check order since APIConnectionError is an APIError subclass with status undefined; (3) replaced the vague SDK-constructor risk note with verified openai@7.45.1 signatures. Frontmatter: review_count 0->1, patch n/a->applied. Status stays draft; implementation not started.
++
++## Files changed
++CONTEXTS/03-implement-plan/PLAN-012-translation-request-retry.md
++
++## Notes
++Plan remains draft awaiting developer approval; assist-path retry adoption remains a documented follow-up.
++
++---
+-- 
+2.50.0
+
+
+From 7be134e0850bde62ce794dec70a791d5c9bd240a Mon Sep 17 00:00:00 2001
+From: Satoshi Man <mrvuong.bitcoin@gmail.com>
+Date: Thu, 5 Nov 2026 22:56:24 +0700
+Subject: [PATCH 5/6] feat(translate): retry transient failures inside the
+ translation request
+
+Wrap chat.completions.create in OpenAICompatTranslator.request() with a
+per-endpoint retry loop (3 attempts, exponential backoff 250ms->2s cap
+with 50-100% jitter). Connection errors, HTTP 408/409/429/5xx, and
+unwrapped transport errors retry; 4xx client errors, aborts, and
+TranslationError escalate immediately to the fallback. Implements and
+closes PLAN-012.
+---
+ .../PLAN-012-translation-request-retry.md     |  16 +-
+ server/translate/openai-compat.test.ts        | 175 +++++++++++++++++-
+ server/translate/openai-compat.ts             |  63 ++++++-
+ 3 files changed, 236 insertions(+), 18 deletions(-)
+
+diff --git a/CONTEXTS/03-implement-plan/PLAN-012-translation-request-retry.md b/CONTEXTS/03-implement-plan/PLAN-012-translation-request-retry.md
+index f7fc071..ffa6c32 100644
+--- a/CONTEXTS/03-implement-plan/PLAN-012-translation-request-retry.md
++++ b/CONTEXTS/03-implement-plan/PLAN-012-translation-request-retry.md
+@@ -1,6 +1,6 @@
+ ---
+ id: PLAN-012-translation-request-retry
+-status: draft
++status: implemented
+ date: 2026-11-05
+ review_count: 1
+ patch: applied
+@@ -10,7 +10,7 @@ patch: applied
+ 
+ ## Status
+ 
+-draft
++implemented
+ 
+ ## Context
+ 
+@@ -264,20 +264,20 @@ Manual acceptance:
+ 
+ ## Definition of Done
+ 
+-- [ ] `RetryPolicy`, `DEFAULT_RETRY_POLICY`,
++- [x] `RetryPolicy`, `DEFAULT_RETRY_POLICY`,
+   `isRetryableTranslationError` exist in
+   `server/translate/openai-compat.ts` with the pinned
+   classification.
+-- [ ] `request()` retries transient errors per endpoint with
++- [x] `request()` retries transient errors per endpoint with
+   bounded exponential backoff + jitter; non-retryable errors and
+   `TranslationError` escalate immediately.
+-- [ ] Primary/fallback ordering and `TranslationError` messages are
++- [x] Primary/fallback ordering and `TranslationError` messages are
+   unchanged; `makeTranslator` signature is unchanged.
+-- [ ] New unit tests cover retry-success, exhaustion-to-fallback,
++- [x] New unit tests cover retry-success, exhaustion-to-fallback,
+   fast-fail 4xx, 5xx/429 retry, unknown-error retry, and the
+   classification function; all run with zero real delay.
+-- [ ] Pre-existing `fakeClient` tests keep their call expectations
++- [x] Pre-existing `fakeClient` tests keep their call expectations
+   unchanged (the fake's `fail` outcome throws a non-retryable
+   `APIError`).
+-- [ ] `npm run typecheck`, `npm test`, `npm --prefix web run
++- [x] `npm run typecheck`, `npm test`, `npm --prefix web run
+   build`, `npm --prefix web run lint` clean.
+diff --git a/server/translate/openai-compat.test.ts b/server/translate/openai-compat.test.ts
+index 5dd0549..2242360 100644
+--- a/server/translate/openai-compat.test.ts
++++ b/server/translate/openai-compat.test.ts
+@@ -1,13 +1,15 @@
+ import { describe, expect, it } from 'vitest';
+ import {
++  isRetryableTranslationError,
+   makeTranslator,
+   OpenAICompatTranslator,
+   renderPrompt,
+   type LLMEndpoint,
++  type RetryPolicy,
+ } from './openai-compat.js';
+ import { TranslationError } from './translator.js';
+ import { parseConfig } from '../config.js';
+-import type OpenAI from 'openai';
++import OpenAI from 'openai';
+ 
+ const endpoint = (url: string, model = 'm'): LLMEndpoint => ({
+   baseURL: url,
+@@ -15,19 +17,44 @@ const endpoint = (url: string, model = 'm'): LLMEndpoint => ({
+   model,
+ });
+ 
+-function fakeClient(behavior: Record<string, 'ok' | 'fail'>) {
++const apiError = (status: number) =>
++  new OpenAI.APIError(status, undefined, `status ${status}`, new Headers());
++
++const instantRetry: RetryPolicy = {
++  attempts: 3,
++  baseDelayMs: 0,
++  maxDelayMs: 0,
++  sleep: async () => {},
++};
++
++type Outcome = 'ok' | 'fail' | Error | { content: string };
++
++function fakeClient(behavior: Record<string, Outcome | Outcome[]>) {
+   const calls: string[] = [];
++  const seq: Record<string, number> = {};
+   const factory = (ep: LLMEndpoint) =>
+     ({
+       chat: {
+         completions: {
+           create: async () => {
+             calls.push(ep.baseURL);
+-            if (behavior[ep.baseURL] === 'fail') {
+-              throw new Error(`boom from ${ep.baseURL}`);
+-            }
++            const b = behavior[ep.baseURL];
++            const i = seq[ep.baseURL] ?? 0;
++            seq[ep.baseURL] = i + 1;
++            const outcome = Array.isArray(b) ? b[Math.min(i, b.length - 1)] : b;
++            if (outcome === 'fail') throw apiError(401);
++            if (outcome instanceof Error) throw outcome;
+             return {
+-              choices: [{ message: { content: `translated via ${ep.baseURL}` } }],
++              choices: [
++                {
++                  message: {
++                    content:
++                      typeof outcome === 'object' && outcome !== null
++                        ? outcome.content
++                        : `translated via ${ep.baseURL}`,
++                  },
++                },
++              ],
+             };
+           },
+         },
+@@ -84,6 +111,107 @@ describe('OpenAICompatTranslator', () => {
+     expect(calls).toEqual(['https://p', 'https://f']);
+   });
+ 
++  it('succeeds on the second try after a transient connection error', async () => {
++    const { calls, factory } = fakeClient({
++      'https://p': [new OpenAI.APIConnectionError({ message: 'reset' }), 'ok'],
++    });
++    const t = new OpenAICompatTranslator(
++      endpoint('https://p'),
++      endpoint('https://f'),
++      factory,
++      instantRetry,
++    );
++    const out = await t.translate(segment, [], 'vi');
++    expect(out).toBe('translated via https://p');
++    expect(calls).toEqual(['https://p', 'https://p']);
++  });
++
++  it('escalates to the fallback after exhausting retries on the primary', async () => {
++    const { calls, factory } = fakeClient({
++      'https://p': new OpenAI.APIConnectionError({ message: 'down' }),
++      'https://f': 'ok',
++    });
++    const t = new OpenAICompatTranslator(
++      endpoint('https://p'),
++      endpoint('https://f'),
++      factory,
++      instantRetry,
++    );
++    const out = await t.translate(segment, [], 'vi');
++    expect(out).toBe('translated via https://f');
++    expect(calls).toEqual([
++      'https://p',
++      'https://p',
++      'https://p',
++      'https://f',
++    ]);
++  });
++
++  it('fails fast on a non-retryable error without same-endpoint retry', async () => {
++    const { calls, factory } = fakeClient({
++      'https://p': apiError(401),
++      'https://f': 'ok',
++    });
++    const t = new OpenAICompatTranslator(
++      endpoint('https://p'),
++      endpoint('https://f'),
++      factory,
++      instantRetry,
++    );
++    const out = await t.translate(segment, [], 'vi');
++    expect(out).toBe('translated via https://f');
++    expect(calls).toEqual(['https://p', 'https://f']);
++  });
++
++  it.each([500, 429])(
++    'retries a retryable APIError with status %d on the same endpoint',
++    async (status) => {
++      const { calls, factory } = fakeClient({
++        'https://p': [apiError(status), 'ok'],
++      });
++      const t = new OpenAICompatTranslator(
++        endpoint('https://p'),
++        undefined,
++        factory,
++        instantRetry,
++      );
++      const out = await t.translate(segment, [], 'vi');
++      expect(out).toBe('translated via https://p');
++      expect(calls).toEqual(['https://p', 'https://p']);
++    },
++  );
++
++  it('retries an unwrapped transport error', async () => {
++    const { calls, factory } = fakeClient({
++      'https://p': [new TypeError('fetch failed'), 'ok'],
++    });
++    const t = new OpenAICompatTranslator(
++      endpoint('https://p'),
++      undefined,
++      factory,
++      instantRetry,
++    );
++    const out = await t.translate(segment, [], 'vi');
++    expect(out).toBe('translated via https://p');
++    expect(calls).toEqual(['https://p', 'https://p']);
++  });
++
++  it('does not retry an empty translation response on the same endpoint', async () => {
++    const { calls, factory } = fakeClient({
++      'https://p': { content: '[Speaker 1]' },
++      'https://f': 'ok',
++    });
++    const t = new OpenAICompatTranslator(
++      endpoint('https://p'),
++      endpoint('https://f'),
++      factory,
++      instantRetry,
++    );
++    const out = await t.translate(segment, [], 'vi');
++    expect(out).toBe('translated via https://f');
++    expect(calls).toEqual(['https://p', 'https://f']);
++  });
++
+   const respondWith = (content: string) =>
+     (() =>
+       ({
+@@ -136,6 +264,41 @@ describe('OpenAICompatTranslator', () => {
+   });
+ });
+ 
++describe('isRetryableTranslationError', () => {
++  it('classifies connection errors, retryable statuses, and unknown errors as retryable', () => {
++    const retryable: unknown[] = [
++      new OpenAI.APIConnectionError({ message: 'reset' }),
++      new OpenAI.APIConnectionTimeoutError({ message: 'timeout' }),
++      apiError(408),
++      apiError(409),
++      OpenAI.APIError.generate(429, undefined, 'rate limited', new Headers()),
++      apiError(500),
++      apiError(503),
++      new TypeError('fetch failed'),
++      'string noise',
++      { weird: true },
++    ];
++    for (const err of retryable) {
++      expect(isRetryableTranslationError(err)).toBe(true);
++    }
++  });
++
++  it('classifies client errors, aborts, and TranslationError as non-retryable', () => {
++    const nonRetryable: unknown[] = [
++      apiError(400),
++      apiError(401),
++      apiError(403),
++      apiError(404),
++      apiError(422),
++      new OpenAI.APIUserAbortError(),
++      new TranslationError('empty translation response'),
++    ];
++    for (const err of nonRetryable) {
++      expect(isRetryableTranslationError(err)).toBe(false);
++    }
++  });
++});
++
+ describe('renderPrompt', () => {
+   it('labels the segment and context with speakers and target language', () => {
+     const out = renderPrompt(
+diff --git a/server/translate/openai-compat.ts b/server/translate/openai-compat.ts
+index 3b05342..f8a65fc 100644
+--- a/server/translate/openai-compat.ts
++++ b/server/translate/openai-compat.ts
+@@ -27,6 +27,41 @@ export const defaultClientFactory: ClientFactory = (endpoint) =>
+     maxRetries: 0,
+   });
+ 
++export interface RetryPolicy {
++  attempts: number; // total tries per endpoint, minimum 1
++  baseDelayMs: number;
++  maxDelayMs: number;
++  sleep?: (ms: number) => Promise<void>;
++}
++
++export const DEFAULT_RETRY_POLICY: RetryPolicy = {
++  attempts: 3,
++  baseDelayMs: 250,
++  maxDelayMs: 2_000,
++};
++
++const sleep = (ms: number): Promise<void> =>
++  new Promise((resolve) => setTimeout(resolve, ms));
++
++// Check order matters: APIConnectionError is an APIError subclass whose
++// status is undefined, so it must be tested before the generic APIError
++// branch. APIUserAbortError (also status undefined) falls through to
++// non-retryable: a deliberate abort is never retried.
++export function isRetryableTranslationError(err: unknown): boolean {
++  if (err instanceof OpenAI.APIConnectionError) return true;
++  if (err instanceof OpenAI.APIError) {
++    const status = err.status;
++    return (
++      status === 408 ||
++      status === 409 ||
++      status === 429 ||
++      (status != null && status >= 500)
++    );
++  }
++  if (err instanceof TranslationError) return false;
++  return true;
++}
++
+ // ADR-003: one OpenAI-compatible client shape serves DeepSeek (primary) and
+ // OpenAI (fallback); env vars repoint it without code changes.
+ export class OpenAICompatTranslator implements Translator {
+@@ -34,6 +69,7 @@ export class OpenAICompatTranslator implements Translator {
+     private readonly primary: LLMEndpoint,
+     private readonly fallback: LLMEndpoint | undefined,
+     private readonly clientFactory: ClientFactory = defaultClientFactory,
++    private readonly retryPolicy: RetryPolicy = DEFAULT_RETRY_POLICY,
+   ) {}
+ 
+   async translate(
+@@ -84,10 +120,29 @@ export class OpenAICompatTranslator implements Translator {
+       temperature: 0.2,
+       ...endpoint.extraBody,
+     };
+-    const res = (await client.chat.completions.create(
+-      body as never,
+-    )) as OpenAI.ChatCompletion;
+-    const text = res.choices[0]?.message?.content?.trim();
++    const maxAttempts = Math.max(1, this.retryPolicy.attempts);
++    const sleepFn = this.retryPolicy.sleep ?? sleep;
++    let res: OpenAI.ChatCompletion | undefined;
++    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
++      try {
++        res = (await client.chat.completions.create(
++          body as never,
++        )) as OpenAI.ChatCompletion;
++        break;
++      } catch (err) {
++        if (attempt === maxAttempts || !isRetryableTranslationError(err)) {
++          throw err;
++        }
++        const delay =
++          Math.min(
++            this.retryPolicy.maxDelayMs,
++            this.retryPolicy.baseDelayMs * 2 ** (attempt - 1),
++          ) *
++          (0.5 + Math.random() * 0.5);
++        await sleepFn(delay);
++      }
++    }
++    const text = res?.choices[0]?.message?.content?.trim();
+     const cleaned = text ? stripSpeakerLabel(text, segment.speaker) : '';
+     if (!cleaned) {
+       throw new TranslationError('empty translation response');
+-- 
+2.50.0
+
+
+From 791f1d5d03e44bba5443d84ad625f3fc06aad338 Mon Sep 17 00:00:00 2001
+From: Satoshi Man <mrvuong.bitcoin@gmail.com>
+Date: Thu, 5 Nov 2026 22:56:34 +0700
+Subject: [PATCH 6/6] log: event for PLAN-012 implementation
+
+---
+ CONTEXTS/04-logs/2026-11-05.md | 40 ++++++++++++++++++++++++++++++++--
+ 1 file changed, 38 insertions(+), 2 deletions(-)
+
+diff --git a/CONTEXTS/04-logs/2026-11-05.md b/CONTEXTS/04-logs/2026-11-05.md
+index f6c09c8..e39acd2 100644
+--- a/CONTEXTS/04-logs/2026-11-05.md
++++ b/CONTEXTS/04-logs/2026-11-05.md
+@@ -1,11 +1,11 @@
+ ---
+ date: "2026-11-05"
+-events_count: 90
++events_count: 91
+ ---
+ 
+ # Events on 2026-11-05
+ 
+-Total events: **90**
++Total events: **91**
+ 
+ ## Table of contents
+ 
+@@ -99,6 +99,7 @@ Total events: **90**
+ - [18:31 - Standardize workflow name in README](#1831---standardize-workflow-name-in-readme)
+ - [22:50 - Draft PLAN-012: retry transient translation request failures](#2250---draft-plan-012-retry-transient-translation-request-failures)
+ - [22:53 - Verification pass 1 on PLAN-012](#2253---verification-pass-1-on-plan-012)
++- [22:56 - Implement PLAN-012: retry transient translation request failures](#2256---implement-plan-012-retry-transient-translation-request-failures)
+ 
+ ---
+ 
+@@ -3192,3 +3193,38 @@ CONTEXTS/03-implement-plan/PLAN-012-translation-request-retry.md
+ Plan remains draft awaiting developer approval; assist-path retry adoption remains a documented follow-up.
+ 
+ ---
++## 22:56 - Implement PLAN-012: retry transient translation request failures
++
++**Scope:** server/translate | **Type:** Feature | **Commit:** 7be134e @ doc-centric-vague
++
++## Scope
++server/translate
++
++## Type
++Feature
++
++## Commit
++- **Hash:** 7be134e
++- **Repo:** doc-centric-vague
++- **Message:** feat(translate): retry transient failures inside the translation request
++- **Author:** Satoshi Man <mrvuong.bitcoin@gmail.com>
++- **Date:** 2026-11-05 22:56:24 +0700
++
++## User request
++Implement the newest PLAN in CONTEXTS/03-implement-plan/ exactly per its scope and DoD. Commit, tick DoD items, set status: implemented, and log via event.py.
++
++## Reason
++User reported translation calls dying on transient network errors; PLAN-012 pins in-request retry with bounded backoff so blips do not consume outer translateSegment attempts or trigger premature fallback. Verified gates: typecheck, vitest 154/154, web build, web lint.
++
++## Description
++Added RetryPolicy, DEFAULT_RETRY_POLICY, and isRetryableTranslationError to openai-compat.ts; wrapped chat.completions.create in a per-endpoint retry loop with exponential backoff (250ms base, 2s cap) plus 50-100% jitter. Connection errors, 408/409/429/5xx, and unwrapped errors retry in place; 4xx, aborts, and TranslationError escalate to the fallback immediately. Extended fakeClient with per-call outcome queues and added retry/classification unit tests; marked PLAN-012 implemented with all DoD items checked.
++
++## Files changed
++server/translate/openai-compat.ts
++server/translate/openai-compat.test.ts
++CONTEXTS/03-implement-plan/PLAN-012-translation-request-retry.md
++
++## Notes
++Assist path can adopt the same RetryPolicy helper later (explicit follow-up). Retry-After header not honored; retry diagnostics/logging deferred.
++
++---
+-- 
+2.50.0
+

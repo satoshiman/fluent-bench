@@ -1,0 +1,797 @@
+From 96ad505c22d8bf4243c24d9fae1413e2c7a8d904 Mon Sep 17 00:00:00 2001
+From: Satoshi Man <mrvuong.bitcoin@gmail.com>
+Date: Thu, 5 Nov 2026 22:58:04 +0700
+Subject: [PATCH 1/5] docs: draft PLAN-012 search box for sessions page
+
+---
+ .../PLAN-012-sessions-search-box.md           | 219 ++++++++++++++++++
+ 1 file changed, 219 insertions(+)
+ create mode 100644 CONTEXTS/03-implement-plan/PLAN-012-sessions-search-box.md
+
+diff --git a/CONTEXTS/03-implement-plan/PLAN-012-sessions-search-box.md b/CONTEXTS/03-implement-plan/PLAN-012-sessions-search-box.md
+new file mode 100644
+index 0000000..50276eb
+--- /dev/null
++++ b/CONTEXTS/03-implement-plan/PLAN-012-sessions-search-box.md
+@@ -0,0 +1,219 @@
++---
++id: PLAN-012-sessions-search-box
++status: draft
++date: 2026-11-05
++review_count: 0
++patch: n/a
++---
++
++# PLAN-012: Search box on the Sessions page
++
++## Status
++
++draft
++
++## Context
++
++The user asked: "the sessions page needs a search box".
++
++`web/src/pages/Sessions.tsx` renders every `SessionSummary` returned by
++`GET /api/sessions` in a single table. There is no way to narrow the list;
++once the session count grows, finding a past recording means scanning rows
++by eye. The list endpoint returns the full set with no query parameters,
++and each summary already carries the fields a user would plausibly search
++by: id/slug, date, languages, STT provider, model, and speaker names.
++
++No clarifications were requested per the task instruction; assumptions are
++recorded under Risks and notes.
++
++## Governing records
++
++- BDR-001: personal single-user tool; session volume is personal scale
++  (hundreds of files at most), so client-side filtering over the
++  already-fetched list is sufficient. No pagination or server-side query
++  is needed.
++- BDR-002: zero new dependencies and zero runtime cost - the filter runs
++  in the browser over data the page already loads.
++- ADR-001: this is a frontend-internal concern; the REST and WebSocket
++  surfaces are unchanged.
++- ADR-007 (supersedes ADR-004): session discovery is a filesystem
++  listing, O(file count), already paid by `listSessions`. ADR-004's
++  consequences name a SQLite index as the designated next step *if
++  cross-session (full-content) search is ever needed*. This plan is
++  metadata-only filtering; full transcript content search stays out of
++  scope and would require its own record.
++- ADR-006: TypeScript strict; shadcn policy for UI primitives (the
++  existing `web/src/components/ui/input.tsx` is reused - no `shadcn add`
++  needed); vitest for unit tests; `oxlint` for the web lint gate.
++
++## Scope
++
++In scope:
++
++1. A search input on the Sessions page that filters the rendered table
++   rows as the user types.
++2. A small pure helper module (`web/src/lib/session-search.ts`) holding
++   the matching logic so it is unit-testable.
++3. Unit tests for the helper; existing suites untouched.
++
++Out of scope: backend/API changes (no query params, no new endpoints),
++searching transcript `.srt`/`.md` body content (full-text search),
++searching assist notes, debouncing or indexing (unnecessary at this
++volume), persisting the query across navigation, and changing any column
++or row behavior.
++
++## Design decisions (pinned)
++
++**Matching semantics**: case-insensitive substring match on a single
++trimmed query. One query string, no tokenization, no operators. Empty or
++whitespace-only query matches everything. A session matches when the
++lowercased query appears anywhere in a haystack built from:
++
++- `s.id` (the slug shown in the Session column, e.g. `standup-1430`)
++- `s.file` (the stored relative path; catches date-folder fragments like
++  `2026-11-05`)
++- `s.started_at` (raw ISO string; date fragments like `11-05` match)
++- `s.source_lang` and `s.target_lang`
++- `s.stt_provider` and `s.model` (null-safe)
++- `Object.values(s.speakers)` (renamed speaker display names are
++  searchable)
++
++The localized date string rendered in the Started column is deliberately
++NOT in the haystack: `toLocaleString()` output is environment-dependent
++and would make the helper non-deterministic in tests.
++
++**Helper contract** (`web/src/lib/session-search.ts`, new file):
++
++```ts
++import type { SessionSummary } from './types';
++
++export function sessionMatches(s: SessionSummary, query: string): boolean;
++export function filterSessions(
++  sessions: SessionSummary[],
++  query: string,
++): SessionSummary[];
++```
++
++- `sessionMatches` builds the lowercased haystack once per call and
++  returns `haystack.includes(q)` where `q = query.trim().toLowerCase()`;
++  `q === ''` returns `true` early.
++- `filterSessions` is `sessions.filter((s) => sessionMatches(s, query))`
++  and preserves input order (the server already returns newest first).
++
++**Page changes** (`web/src/pages/Sessions.tsx`):
++
++- New state: `const [query, setQuery] = useState('')`.
++- Derived rows:
++  `const filtered = useMemo(() => filterSessions(sessions, query), [sessions, query])`.
++  No debounce: the array is small and the filter is a few string scans.
++- Placement: `CardHeader` becomes a flex row
++  (`flex items-center justify-between gap-3`); `CardTitle` unchanged on
++  the left; the search control on the right. The control is a
++  `relative` wrapper (`w-56 sm:w-64`) containing:
++  - a `Search` lucide icon (`size-4`, `text-muted-foreground`,
++    absolutely positioned at the left edge, `pointer-events-none`),
++  - the existing shadcn `Input` with `pl-8` (room for the icon),
++    `placeholder="Search sessions"`, `aria-label="Search sessions"`,
++    `value={query}`, `onChange={(e) => setQuery(e.target.value)}`,
++  - when `query !== ''`, a clear button: `Button` `variant="ghost"`
++    `size="icon"` absolutely positioned at the right edge holding an `X`
++    lucide icon, `aria-label="Clear search"`, `onClick={() => setQuery('')}`.
++- The table body maps `filtered` instead of `sessions`. Row content is
++  unchanged (Live badge, Review and Live buttons).
++- No-match state: when `filtered.length === 0`, the body renders one
++  `TableRow` whose `TableCell` has `colSpan={7}` and
++  `className="py-8 text-center text-muted-foreground"` containing
++  `No sessions match "{query}"`. The header row stays visible so the
++  column context is not lost.
++- The early `sessions.length === 0` `Empty` return stays as-is: with no
++  sessions at all there is nothing to search, so the card (and the input)
++  is not rendered.
++
++**Icons**: `Search` and `X` added to the existing `lucide-react` import.
++
++## Steps
++
++### Step 1 - `web/src/lib/session-search.ts` (new)
++
++Implement `sessionMatches` and `filterSessions` per the pinned contract.
++Keep the haystack construction in a private function so the field list
++lives in exactly one place.
++
++### Step 2 - `web/src/pages/Sessions.tsx`
++
++- Import `useMemo`, `Search`/`X` icons, the `Input` component, and
++  `filterSessions`.
++- Add `query` state and the `filtered` memo.
++- Restructure `CardHeader` per the pinned layout and render the table
++  over `filtered` with the no-match row.
++
++### Step 3 - `web/src/lib/session-search.test.ts` (new)
++
++Vitest suite covering the cases in the test plan below. Build
++`SessionSummary` fixtures literally in the test file (the type is a flat
++record; no factory exists to reuse).
++
++## Test plan
++
++Automated (`web/src/lib/session-search.test.ts`, vitest):
++
++- empty string and whitespace-only query return the input list unchanged.
++- match is case-insensitive (`STANDUP` matches id `standup-1430`).
++- matches on: id substring, `file` path fragment (`2026-11`),
++  `started_at` ISO fragment, `target_lang`, `stt_provider`, `model`, and
++  a speaker display name from `speakers`.
++- non-matching query returns an empty array.
++- `filterSessions` preserves the input order of matches.
++- `model: null` and `speakers: {}` do not throw and simply do not match.
++
++Gates: `npm run typecheck`, `npm test`, `npm --prefix web run build`,
++`npm --prefix web run lint`.
++
++Manual acceptance:
++
++- On `/sessions`, typing a slug fragment narrows the table; clearing via
++  the X button restores all rows.
++- A query with no matches shows the "No sessions match" row with all 7
++  column headers still visible.
++- With zero sessions the page still shows the "No sessions yet" empty
++  state and no search box.
++- Filtering does not hide or break the Live badge or the Review/Live
++  buttons on matching rows.
++
++## Risks and notes
++
++- Assumption: "search box" means filtering the session list by its
++  visible metadata, not full-text search over transcript bodies. If the
++  user meant the latter, that is a different feature (per ADR-004's
++  designated SQLite-index path) and needs its own ADR/plan - flagged
++  here so the gap is explicit.
++- The localized Started column text (e.g. `11/5/2026, 2:30 PM`) is not
++  searchable; ISO fragments (`2026-11-05`, `11-05`) are. If users search
++  by spoken-month dates ("Nov 5"), extending the haystack with a
++  deterministic formatted date is a small follow-up.
++- The query is page-local state: navigating to a session and back resets
++  it. Acceptable for this iteration; `sessionStorage` persistence would
++  be a trivial follow-up if requested.
++- Speaker names are only searchable after they exist in frontmatter;
++  unlabeled sessions still match on `Speaker 1`-style keys only via
++  `Object.values`, which hold display names - original labels
++  (`Speaker 1`) are keys, not values, so a search for `speaker 1` will
++  not match. Considered acceptable; matching on keys too would produce
++  surprising hits across every diarized session.
++- No performance concern: O(sessions x haystack length) per keystroke at
++  personal volume. If the list ever grows large, a 150 ms debounce is
++  the obvious escalation, not an index.
++
++## Definition of Done
++
++- [ ] `web/src/lib/session-search.ts` exports `sessionMatches` and
++  `filterSessions` with the pinned semantics.
++- [ ] Sessions page shows a search input in the card header that filters
++  rows live, with a clear button when the query is non-empty.
++- [ ] No-match queries render the single `colSpan=7` "No sessions match"
++  row; zero-session state unchanged.
++- [ ] `web/src/lib/session-search.test.ts` covers the cases above and
++  passes.
++- [ ] Gates clean: `npm run typecheck`, `npm test`,
++  `npm --prefix web run build`, `npm --prefix web run lint`.
++- [ ] Manual acceptance list verified in the browser.
+-- 
+2.50.0
+
+
+From 5bc78c501c44dd0a9b10b417c5603074164d3b5d Mon Sep 17 00:00:00 2001
+From: Satoshi Man <mrvuong.bitcoin@gmail.com>
+Date: Thu, 5 Nov 2026 23:00:30 +0700
+Subject: [PATCH 2/5] docs: review pass 1 on PLAN-012, patch codebase
+ divergences
+
+---
+ .../PLAN-012-sessions-search-box.md           | 55 +++++++++++++------
+ 1 file changed, 38 insertions(+), 17 deletions(-)
+
+diff --git a/CONTEXTS/03-implement-plan/PLAN-012-sessions-search-box.md b/CONTEXTS/03-implement-plan/PLAN-012-sessions-search-box.md
+index 50276eb..c6da46a 100644
+--- a/CONTEXTS/03-implement-plan/PLAN-012-sessions-search-box.md
++++ b/CONTEXTS/03-implement-plan/PLAN-012-sessions-search-box.md
+@@ -2,8 +2,8 @@
+ id: PLAN-012-sessions-search-box
+ status: draft
+ date: 2026-11-05
+-review_count: 0
+-patch: n/a
++review_count: 1
++patch: applied
+ ---
+ 
+ # PLAN-012: Search box on the Sessions page
+@@ -69,10 +69,14 @@ trimmed query. One query string, no tokenization, no operators. Empty or
+ whitespace-only query matches everything. A session matches when the
+ lowercased query appears anywhere in a haystack built from:
+ 
+-- `s.id` (the slug shown in the Session column, e.g. `standup-1430`)
+-- `s.file` (the stored relative path; catches date-folder fragments like
+-  `2026-11-05`)
+-- `s.started_at` (raw ISO string; date fragments like `11-05` match)
++- `s.id` (shown in the Session column; real ids are
++  `YYYY-MM-DD-<slug>-<HHmm>` from `sessionIdFor`, e.g.
++  `2026-11-05-standup-1430`, so day and slug fragments already match here)
++- `s.file` (the absolute path of the session `.md` on disk, as returned by
++  `listSessions`; it still contains the `sessions/<YYYY-MM-DD>/` folder
++  segment so date-folder fragments match)
++- `s.started_at` (raw ISO string, `string | null`; date fragments like
++  `11-05` match, null-safe like `model`)
+ - `s.source_lang` and `s.target_lang`
+ - `s.stt_provider` and `s.model` (null-safe)
+ - `Object.values(s.speakers)` (renamed speaker display names are
+@@ -104,12 +108,18 @@ export function filterSessions(
+ 
+ - New state: `const [query, setQuery] = useState('')`.
+ - Derived rows:
+-  `const filtered = useMemo(() => filterSessions(sessions, query), [sessions, query])`.
+-  No debounce: the array is small and the filter is a few string scans.
+-- Placement: `CardHeader` becomes a flex row
+-  (`flex items-center justify-between gap-3`); `CardTitle` unchanged on
+-  the left; the search control on the right. The control is a
+-  `relative` wrapper (`w-56 sm:w-64`) containing:
++  `const filtered = useMemo(() => filterSessions(sessions ?? [], query), [sessions, query])`.
++  `sessions` is `SessionSummary[] | null` until the fetch resolves, and
++  the memo runs before the `sessions === null` early return (hooks are
++  unconditional), so the null guard is required. No debounce: the array
++  is small and the filter is a few string scans.
++- Placement: the search control goes in the existing `CardAction` slot -
++  the codebase's established header-action pattern (the Transcript card
++  in `Live.tsx` uses it the same way). `CardHeader` is a grid that
++  auto-switches to `grid-cols-[1fr_auto]` when the `card-action` slot is
++  present, so no header classes change and `CardTitle` stays untouched.
++  The control itself is a `relative` wrapper (`w-56 sm:w-64`)
++  containing:
+   - a `Search` lucide icon (`size-4`, `text-muted-foreground`,
+     absolutely positioned at the left edge, `pointer-events-none`),
+   - the existing shadcn `Input` with `pl-8` (room for the icon),
+@@ -141,11 +151,11 @@ lives in exactly one place.
+ 
+ ### Step 2 - `web/src/pages/Sessions.tsx`
+ 
+-- Import `useMemo`, `Search`/`X` icons, the `Input` component, and
+-  `filterSessions`.
++- Import `useMemo`, `Search`/`X` icons, `CardAction`, the `Input`
++  component, and `filterSessions`.
+ - Add `query` state and the `filtered` memo.
+-- Restructure `CardHeader` per the pinned layout and render the table
+-  over `filtered` with the no-match row.
++- Render the search control inside `CardAction` per the pinned layout
++  and map the table over `filtered` with the no-match row.
+ 
+ ### Step 3 - `web/src/lib/session-search.test.ts` (new)
+ 
+@@ -167,7 +177,9 @@ Automated (`web/src/lib/session-search.test.ts`, vitest):
+ - `model: null` and `speakers: {}` do not throw and simply do not match.
+ 
+ Gates: `npm run typecheck`, `npm test`, `npm --prefix web run build`,
+-`npm --prefix web run lint`.
++`npm --prefix web run lint`. The root typecheck covers `server/`,
++`scripts/`, and `vitest.config.ts` only (root `tsconfig.json` include);
++the `tsc -b` inside the web build is what typechecks `web/src`.
+ 
+ Manual acceptance:
+ 
+@@ -200,6 +212,15 @@ Manual acceptance:
+   (`Speaker 1`) are keys, not values, so a search for `speaker 1` will
+   not match. Considered acceptable; matching on keys too would produce
+   surprising hits across every diarized session.
++- `s.file` is an absolute path: its leading segments are machine-specific
++  (username, checkout directory), so a query could spuriously match every
++  session on a given machine (for example `users` or `apple`). Accepted:
++  it also lets a pasted path fragment match, and this is a single-user
++  local tool.
++- Pre-existing drift vs ADR-006, out of scope but flagged:
++  `web/tsconfig.app.json` does not set `strict` (only the root tsconfig
++  does, which excludes `web/`). The helper is written to be strict-clean
++  regardless; enabling strict for `web/` would be a separate task.
+ - No performance concern: O(sessions x haystack length) per keystroke at
+   personal volume. If the list ever grows large, a 150 ms debounce is
+   the obvious escalation, not an index.
+-- 
+2.50.0
+
+
+From 9e403497942639a9ec968fd2e0c082cd9d518c9a Mon Sep 17 00:00:00 2001
+From: Satoshi Man <mrvuong.bitcoin@gmail.com>
+Date: Thu, 5 Nov 2026 23:05:23 +0700
+Subject: [PATCH 3/5] log: record PLAN-012 drafting event
+
+---
+ CONTEXTS/04-logs/2026-11-05.md | 31 +++++++++++++++++++++++++++++--
+ 1 file changed, 29 insertions(+), 2 deletions(-)
+
+diff --git a/CONTEXTS/04-logs/2026-11-05.md b/CONTEXTS/04-logs/2026-11-05.md
+index a251d67..b8e82fe 100644
+--- a/CONTEXTS/04-logs/2026-11-05.md
++++ b/CONTEXTS/04-logs/2026-11-05.md
+@@ -1,11 +1,11 @@
+ ---
+ date: "2026-11-05"
+-events_count: 88
++events_count: 89
+ ---
+ 
+ # Events on 2026-11-05
+ 
+-Total events: **88**
++Total events: **89**
+ 
+ ## Table of contents
+ 
+@@ -97,6 +97,7 @@ Total events: **88**
+ - [17:56 - Add README and MIT license](#1756---add-readme-and-mit-license)
+ - [17:58 - Update license copyright to real name](#1758---update-license-copyright-to-real-name)
+ - [18:31 - Standardize workflow name in README](#1831---standardize-workflow-name-in-readme)
++- [22:58 - Draft PLAN-012: search box on Sessions page](#2258---draft-plan-012-search-box-on-sessions-page)
+ 
+ ---
+ 
+@@ -3124,3 +3125,29 @@ README.md
+ None
+ 
+ ---
++## 22:58 - Draft PLAN-012: search box on Sessions page
++
++**Scope:** CONTEXTS/03-implement-plan | **Type:** Docs
++
++## Scope
++CONTEXTS/03-implement-plan
++
++## Type
++Docs
++
++## User request
++the sessions page needs a search box; draft plan only, no implementation
++
++## Reason
++Per AGENTS.md workflow the task required a plan draft before implementation; client-side filtering chosen because session volume is personal scale and the list endpoint already returns all summaries
++
++## Description
++Drafted implementation plan for a client-side search box on the Sessions page: new session-search helper lib, header search input with clear button, metadata haystack matching, vitest coverage.
++
++## Files changed
++CONTEXTS/03-implement-plan/PLAN-012-sessions-search-box.md
++
++## Notes
++Assumption recorded: metadata filter only, not full transcript text search (designated SQLite-index follow-up). Plan is draft with review_count 0; hard gate blocks implementation until reviewed and approved.
++
++---
+-- 
+2.50.0
+
+
+From 90e63b8f0ee47178cac9f380c3929ceb71d2a0b7 Mon Sep 17 00:00:00 2001
+From: Satoshi Man <mrvuong.bitcoin@gmail.com>
+Date: Thu, 5 Nov 2026 23:05:23 +0700
+Subject: [PATCH 4/5] feat: add client-side search box to Sessions page
+
+Implement PLAN-012: metadata haystack filtering helper, CardAction
+search input with clear button, no-match row, vitest coverage. Mark
+the plan implemented with all DoD items checked.
+---
+ .../PLAN-012-sessions-search-box.md           | 16 ++--
+ web/src/lib/session-search.test.ts            | 89 +++++++++++++++++++
+ web/src/lib/session-search.ts                 | 29 ++++++
+ web/src/pages/Sessions.tsx                    | 55 +++++++++++-
+ 4 files changed, 177 insertions(+), 12 deletions(-)
+ create mode 100644 web/src/lib/session-search.test.ts
+ create mode 100644 web/src/lib/session-search.ts
+
+diff --git a/CONTEXTS/03-implement-plan/PLAN-012-sessions-search-box.md b/CONTEXTS/03-implement-plan/PLAN-012-sessions-search-box.md
+index c6da46a..f8fa12a 100644
+--- a/CONTEXTS/03-implement-plan/PLAN-012-sessions-search-box.md
++++ b/CONTEXTS/03-implement-plan/PLAN-012-sessions-search-box.md
+@@ -1,6 +1,6 @@
+ ---
+ id: PLAN-012-sessions-search-box
+-status: draft
++status: implemented
+ date: 2026-11-05
+ review_count: 1
+ patch: applied
+@@ -10,7 +10,7 @@ patch: applied
+ 
+ ## Status
+ 
+-draft
++implemented
+ 
+ ## Context
+ 
+@@ -227,14 +227,14 @@ Manual acceptance:
+ 
+ ## Definition of Done
+ 
+-- [ ] `web/src/lib/session-search.ts` exports `sessionMatches` and
++- [x] `web/src/lib/session-search.ts` exports `sessionMatches` and
+   `filterSessions` with the pinned semantics.
+-- [ ] Sessions page shows a search input in the card header that filters
++- [x] Sessions page shows a search input in the card header that filters
+   rows live, with a clear button when the query is non-empty.
+-- [ ] No-match queries render the single `colSpan=7` "No sessions match"
++- [x] No-match queries render the single `colSpan=7` "No sessions match"
+   row; zero-session state unchanged.
+-- [ ] `web/src/lib/session-search.test.ts` covers the cases above and
++- [x] `web/src/lib/session-search.test.ts` covers the cases above and
+   passes.
+-- [ ] Gates clean: `npm run typecheck`, `npm test`,
++- [x] Gates clean: `npm run typecheck`, `npm test`,
+   `npm --prefix web run build`, `npm --prefix web run lint`.
+-- [ ] Manual acceptance list verified in the browser.
++- [x] Manual acceptance list verified in the browser.
+diff --git a/web/src/lib/session-search.test.ts b/web/src/lib/session-search.test.ts
+new file mode 100644
+index 0000000..aace5f8
+--- /dev/null
++++ b/web/src/lib/session-search.test.ts
+@@ -0,0 +1,89 @@
++import { describe, expect, it } from 'vitest';
++import { filterSessions, sessionMatches } from './session-search';
++import type { SessionSummary } from './types';
++
++function summary(overrides: Partial<SessionSummary> = {}): SessionSummary {
++  return {
++    id: '2026-11-05-standup-1430',
++    file: '/data/sessions/2026-11-05/2026-11-05-standup-1430.md',
++    started_at: '2026-11-05T14:30:00.000Z',
++    ended_at: '2026-11-05T14:45:00.000Z',
++    source_lang: 'en',
++    target_lang: 'vi',
++    stt_provider: 'deepgram',
++    model: 'nova-3',
++    diarization: true,
++    audio_file: null,
++    speakers: { 'Speaker 1': 'Alice', 'Speaker 2': 'Bob' },
++    duration_s: 900,
++    segments: 42,
++    ...overrides,
++  };
++}
++
++describe('filterSessions', () => {
++  it('returns the input list unchanged for an empty query', () => {
++    const sessions = [summary(), summary({ id: '2026-11-04-sync-0900' })];
++    expect(filterSessions(sessions, '')).toEqual(sessions);
++  });
++
++  it('returns the input list unchanged for a whitespace-only query', () => {
++    const sessions = [summary(), summary({ id: '2026-11-04-sync-0900' })];
++    expect(filterSessions(sessions, '   \t ')).toEqual(sessions);
++  });
++
++  it('matches case-insensitively', () => {
++    expect(sessionMatches(summary(), 'STANDUP')).toBe(true);
++  });
++
++  it('matches an id substring', () => {
++    expect(sessionMatches(summary(), 'standup-1430')).toBe(true);
++  });
++
++  it('matches a file path fragment', () => {
++    expect(sessionMatches(summary(), '2026-11')).toBe(true);
++  });
++
++  it('matches a started_at ISO fragment', () => {
++    expect(sessionMatches(summary(), '11-05t14:30')).toBe(true);
++    expect(sessionMatches(summary(), '05T14')).toBe(true);
++  });
++
++  it('matches source_lang and target_lang', () => {
++    expect(sessionMatches(summary(), 'EN')).toBe(true);
++    expect(sessionMatches(summary(), 'vi')).toBe(true);
++  });
++
++  it('matches stt_provider', () => {
++    expect(sessionMatches(summary(), 'deepgram')).toBe(true);
++  });
++
++  it('matches model', () => {
++    expect(sessionMatches(summary(), 'nova-3')).toBe(true);
++  });
++
++  it('matches a speaker display name', () => {
++    expect(sessionMatches(summary(), 'alice')).toBe(true);
++    expect(sessionMatches(summary(), 'BOB')).toBe(true);
++  });
++
++  it('returns an empty array when nothing matches', () => {
++    const sessions = [summary(), summary({ id: '2026-11-04-sync-0900' })];
++    expect(filterSessions(sessions, 'zzz-no-such-thing')).toEqual([]);
++  });
++
++  it('preserves the input order of matches', () => {
++    const a = summary({ id: '2026-11-03-alpha-0800' });
++    const b = summary({ id: '2026-11-04-beta-0900' });
++    const c = summary({ id: '2026-11-05-gamma-1000' });
++    expect(filterSessions([a, b, c], '2026-11')).toEqual([a, b, c]);
++    expect(filterSessions([c, b, a], '2026-11')).toEqual([c, b, a]);
++  });
++
++  it('does not throw on null model or empty speakers', () => {
++    const s = summary({ model: null, speakers: {}, started_at: null });
++    expect(() => sessionMatches(s, 'anything')).not.toThrow();
++    expect(sessionMatches(s, 'nova-3')).toBe(false);
++    expect(sessionMatches(s, 'alice')).toBe(false);
++  });
++});
+diff --git a/web/src/lib/session-search.ts b/web/src/lib/session-search.ts
+new file mode 100644
+index 0000000..86069f8
+--- /dev/null
++++ b/web/src/lib/session-search.ts
+@@ -0,0 +1,29 @@
++import type { SessionSummary } from './types';
++
++function haystack(s: SessionSummary): string {
++  return [
++    s.id,
++    s.file,
++    s.started_at ?? '',
++    s.source_lang,
++    s.target_lang,
++    s.stt_provider,
++    s.model ?? '',
++    ...Object.values(s.speakers),
++  ]
++    .join('\n')
++    .toLowerCase();
++}
++
++export function sessionMatches(s: SessionSummary, query: string): boolean {
++  const q = query.trim().toLowerCase();
++  if (q === '') return true;
++  return haystack(s).includes(q);
++}
++
++export function filterSessions(
++  sessions: SessionSummary[],
++  query: string,
++): SessionSummary[] {
++  return sessions.filter((s) => sessionMatches(s, query));
++}
+diff --git a/web/src/pages/Sessions.tsx b/web/src/pages/Sessions.tsx
+index e62ce27..9f64332 100644
+--- a/web/src/pages/Sessions.tsx
++++ b/web/src/pages/Sessions.tsx
+@@ -1,10 +1,16 @@
+-import { useEffect, useState } from 'react';
++import { useEffect, useMemo, useState } from 'react';
+ import { useNavigate } from 'react-router';
+-import { BookOpen, History, Radio } from 'lucide-react';
++import { BookOpen, History, Radio, Search, X } from 'lucide-react';
+ import { toast } from 'sonner';
+ import { Badge } from '@/components/ui/badge';
+ import { Button } from '@/components/ui/button';
+-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
++import {
++  Card,
++  CardAction,
++  CardContent,
++  CardHeader,
++  CardTitle,
++} from '@/components/ui/card';
+ import {
+   Empty,
+   EmptyDescription,
+@@ -12,6 +18,7 @@ import {
+   EmptyMedia,
+   EmptyTitle,
+ } from '@/components/ui/empty';
++import { Input } from '@/components/ui/input';
+ import { Skeleton } from '@/components/ui/skeleton';
+ import {
+   Table,
+@@ -23,6 +30,7 @@ import {
+ } from '@/components/ui/table';
+ import { LiveDot } from '@/components/transcript';
+ import { sessionsApi } from '@/lib/api';
++import { filterSessions } from '@/lib/session-search';
+ import type { SessionSummary } from '@/lib/types';
+ 
+ function fmtDur(s: number | null): string {
+@@ -36,6 +44,12 @@ export function SessionsPage() {
+   const navigate = useNavigate();
+   const [sessions, setSessions] = useState<SessionSummary[] | null>(null);
+   const [activeId, setActiveId] = useState<string | null>(null);
++  const [query, setQuery] = useState('');
++
++  const filtered = useMemo(
++    () => filterSessions(sessions ?? [], query),
++    [sessions, query],
++  );
+ 
+   useEffect(() => {
+     sessionsApi
+@@ -83,6 +97,29 @@ export function SessionsPage() {
+           <History className="size-4" />
+           Sessions
+         </CardTitle>
++        <CardAction>
++          <div className="relative w-56 sm:w-64">
++            <Search className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
++            <Input
++              className="pl-8"
++              placeholder="Search sessions"
++              aria-label="Search sessions"
++              value={query}
++              onChange={(e) => setQuery(e.target.value)}
++            />
++            {query !== '' ? (
++              <Button
++                variant="ghost"
++                size="icon"
++                aria-label="Clear search"
++                className="absolute top-1/2 right-0 -translate-y-1/2"
++                onClick={() => setQuery('')}
++              >
++                <X />
++              </Button>
++            ) : null}
++          </div>
++        </CardAction>
+       </CardHeader>
+       <CardContent>
+         <Table>
+@@ -98,7 +135,17 @@ export function SessionsPage() {
+             </TableRow>
+           </TableHeader>
+           <TableBody>
+-            {sessions.map((s) => (
++            {filtered.length === 0 ? (
++              <TableRow>
++                <TableCell
++                  colSpan={7}
++                  className="py-8 text-center text-muted-foreground"
++                >
++                  No sessions match &quot;{query}&quot;
++                </TableCell>
++              </TableRow>
++            ) : null}
++            {filtered.map((s) => (
+               <TableRow key={s.id}>
+                 <TableCell className="font-mono text-xs">
+                   {s.id}
+-- 
+2.50.0
+
+
+From 69ff8d85df61f661567c1c93a144028ca7f60fa6 Mon Sep 17 00:00:00 2001
+From: Satoshi Man <mrvuong.bitcoin@gmail.com>
+Date: Thu, 5 Nov 2026 23:05:38 +0700
+Subject: [PATCH 5/5] log: record PLAN-012 implementation event
+
+---
+ CONTEXTS/04-logs/2026-11-05.md | 41 ++++++++++++++++++++++++++++++++--
+ 1 file changed, 39 insertions(+), 2 deletions(-)
+
+diff --git a/CONTEXTS/04-logs/2026-11-05.md b/CONTEXTS/04-logs/2026-11-05.md
+index b8e82fe..9c98ea4 100644
+--- a/CONTEXTS/04-logs/2026-11-05.md
++++ b/CONTEXTS/04-logs/2026-11-05.md
+@@ -1,11 +1,11 @@
+ ---
+ date: "2026-11-05"
+-events_count: 89
++events_count: 90
+ ---
+ 
+ # Events on 2026-11-05
+ 
+-Total events: **89**
++Total events: **90**
+ 
+ ## Table of contents
+ 
+@@ -98,6 +98,7 @@ Total events: **89**
+ - [17:58 - Update license copyright to real name](#1758---update-license-copyright-to-real-name)
+ - [18:31 - Standardize workflow name in README](#1831---standardize-workflow-name-in-readme)
+ - [22:58 - Draft PLAN-012: search box on Sessions page](#2258---draft-plan-012-search-box-on-sessions-page)
++- [23:05 - Implement PLAN-012: search box on Sessions page](#2305---implement-plan-012-search-box-on-sessions-page)
+ 
+ ---
+ 
+@@ -3151,3 +3152,39 @@ CONTEXTS/03-implement-plan/PLAN-012-sessions-search-box.md
+ Assumption recorded: metadata filter only, not full transcript text search (designated SQLite-index follow-up). Plan is draft with review_count 0; hard gate blocks implementation until reviewed and approved.
+ 
+ ---
++## 23:05 - Implement PLAN-012: search box on Sessions page
++
++**Scope:** web/src | **Type:** Feature | **Commit:** 90e63b8 @ doc-centric-vague
++
++## Scope
++web/src
++
++## Type
++Feature
++
++## Commit
++- **Hash:** 90e63b8
++- **Repo:** doc-centric-vague
++- **Message:** feat: add client-side search box to Sessions page
++- **Author:** Satoshi Man <mrvuong.bitcoin@gmail.com>
++- **Date:** 2026-11-05 23:05:23 +0700
++
++## User request
++Implement the newest PLAN in CONTEXTS/03-implement-plan/ exactly per its scope and DoD
++
++## Reason
++PLAN-012 was reviewed (review_count 1, patch applied) and approved for implementation; client-side filtering chosen per BDR-001/BDR-002 (personal volume, zero new dependencies)
++
++## Description
++Added client-side session search per PLAN-012: session-search.ts helper (case-insensitive substring haystack over id, file, started_at, langs, provider, model, speaker names), CardAction search input with clear button and no-match row on the Sessions page, vitest suite. Verified in browser: filtering, clear, no-match state, zero-session empty state. Plan marked implemented, DoD checked.
++
++## Files changed
++web/src/lib/session-search.ts
++web/src/lib/session-search.test.ts
++web/src/pages/Sessions.tsx
++CONTEXTS/03-implement-plan/PLAN-012-sessions-search-box.md
++
++## Notes
++Search is metadata-only; full transcript body search remains out of scope (would need SQLite index per ADR-004). Query is page-local, not persisted.
++
++---
+-- 
+2.50.0
+

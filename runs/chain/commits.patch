@@ -1,0 +1,3196 @@
+From 60c66cb7023a560fe266711cd99a23fb8432bf77 Mon Sep 17 00:00:00 2001
+From: Satoshi Man <mrvuong.bitcoin@gmail.com>
+Date: Thu, 5 Nov 2026 21:57:44 +0700
+Subject: [PATCH 01/17] Draft PLAN-012: pause/resume for session WAV recording
+
+---
+ .../PLAN-012-pause-resume-wav-recording.md    | 232 ++++++++++++++++++
+ 1 file changed, 232 insertions(+)
+ create mode 100644 CONTEXTS/03-implement-plan/PLAN-012-pause-resume-wav-recording.md
+
+diff --git a/CONTEXTS/03-implement-plan/PLAN-012-pause-resume-wav-recording.md b/CONTEXTS/03-implement-plan/PLAN-012-pause-resume-wav-recording.md
+new file mode 100644
+index 0000000..969c8d7
+--- /dev/null
++++ b/CONTEXTS/03-implement-plan/PLAN-012-pause-resume-wav-recording.md
+@@ -0,0 +1,232 @@
++---
++id: PLAN-012-pause-resume-wav-recording
++status: draft
++date: 2026-11-05
++review_count: 0
++patch: n/a
++---
++
++# PLAN-012: Pause/resume for session WAV recording
++
++## Status
++
++draft
++
++## Context
++
++The task asks that pausing a session also pause its WAV recording: no
++audio appended while paused, resume keeps writing to the same file, the
++file stays valid, non-recording sessions are unaffected, and automated
++tests cover the behavior.
++
++Verification against the current tree (all 145 tests pass): `sendAudio`
++in `server/session/manager.ts` already returns early when
++`active.paused`, so paused PCM never reaches `WavRecorder.append`, and
++the existing `session audio recording` test in `server/app.test.ts`
++asserts exactly that drop. The reported "recording keeps going" symptom
++does not reproduce here. What is missing is that the no-append-during-
++pause invariant lives only at that one call site: `WavRecorder` itself
++has no notion of pause, so any present or future `append` path that does
++not flow through the `active.paused` early-return (or a regression that
++moves/removes the check) silently records paused audio. There is also no
++dedicated test for the pause/resume recording contract; the only
++coverage is one inline assertion inside a larger test.
++
++This plan moves the invariant into the class that owns the file:
++`WavRecorder` gains explicit `pause()`/`resume()`, `SessionManager`
++drives them on session pause/resume, and dedicated tests pin the
++contract at both unit and end-to-end level. Observable behavior is
++intended to be identical to today; the change makes the guarantee
++structural instead of incidental.
++
++## Governing records
++
++- BDR-006: session audio is retained as a sibling `.wav` (default on) in
++  the `<stem>.md` / `<stem>.srt` / `<stem>.wav` bundle. This plan keeps
++  the single-file bundle contract: resume continues the same `.wav`, no
++  second artifact is created.
++- ADR-007: `.srt` cue timestamps are session/WAV-relative
++  (`streamBaseS`-shifted, paused wall time excluded). For cue times to
++  keep matching audio positions, paused time must produce zero WAV
++  bytes. That fixes the semantic choice: paused audio is dropped, not
++  replaced with silence.
++- ADR-001: the backend owns the filesystem artifacts; the fix lives in
++  `server/` (recorder + manager). The web client already tears down
++  capture on pause and drops nothing it still owes the server; stray
++  in-flight chunks are handled server-side as today.
++- ADR-006 / BDR-002: no new dependencies; the change is a boolean flag
++  plus tests.
++
++## Scope
++
++In scope:
++
++1. `server/audio/wav-recorder.ts`: `pause()` / `resume()` methods on
++   `WavRecorder`, dropping `append` calls submitted while paused.
++2. `server/session/manager.ts`: call `recorder.pause()` /
++   `recorder.resume()` from the session `pause()` / `resume()` paths.
++3. Automated tests: `server/audio/wav-recorder.test.ts` (unit) and
++   `server/app.test.ts` (end-to-end pause/resume recording cases).
++
++Out of scope:
++
++- Client changes (`web/`): capture pause already stops chunk production;
++  server-side drop covers anything still in flight.
++- Inserting silence or a gap marker into the WAV for the paused window
++  (rejected: breaks the ADR-007 cue-time alignment and adds nothing a
++  player needs - contiguous PCM is the correct artifact).
++- Incremental header patching so an unfinalized WAV reports a nonzero
++  duration (pre-existing limitation noted in PLAN-010 Risks).
++- Changes to `SessionInfo`, REST schemas, or socket events: pause state
++  is already broadcast via `session` events; recording pause needs no
++  new surface.
++
++## Contracts (literal)
++
++`server/audio/wav-recorder.ts` gains:
++
++```ts
++// WavRecorder
++pause(): void;    // appends submitted from now on are dropped; idempotent
++resume(): void;   // appends resume landing in the same file; idempotent
++get isPaused(): boolean; // observable state, used by tests
++```
++
++Pinned semantics:
++
++- `pause()` / `resume()` are synchronous flag flips on a private
++  `paused` field; they never touch the write queue, the fd, or the file.
++- `append(chunk)` checks `paused` at CALL time, before enqueueing:
++  `if (this.paused) return Promise.resolve();`. Checking at call time
++  (not inside the queued op) is a deliberate ordering decision: writes
++  already queued when `pause()` runs still complete, because those bytes
++  were captured before the pause. Anything submitted after the flag
++  flips is paused audio and is dropped. The single-threaded event loop
++  makes the flag boundary exact.
++- `bytesWritten` counts only bytes actually written; dropped appends
++  leave it unchanged.
++- `finalize()` and `abort()` are pause-agnostic: stop-while-paused must
++  still patch the header and close (existing `stop while paused ends the
++  session normally` flow). `done` keeps appends no-ops after finalize.
++- `isPaused` exists so tests assert state without reaching into private
++  fields; the manager does not consume it.
++
++`server/session/manager.ts` wiring:
++
++- `pause()`: after `active.paused = true; active.pausedAtMs = ...;
++  active.info.paused = true;` add `active.recorder?.pause();` (before
++  `stream.close()`; the recorder flag flip is synchronous and cheap).
++- `resume()`: after `active.stream = await this.openStream(active)` and
++  the paused fields flip to false, add `active.recorder?.resume();`.
++  Placement matters: if `openStream` throws, the session stays paused
++  and the recorder must stay paused too, so resume() on the recorder
++  runs only after the stream is confirmed open.
++- `sendAudio` keeps its `if (!active || active.paused) return;` early
++  return unchanged: it still guards the provider `send_audio` call,
++  which the recorder flag cannot. The two checks are intentional
++  redundancy - the manager gate protects the STT stream, the recorder
++  flag protects the file.
++- `recorder` stays `WavRecorder | null`; `?.` makes the non-recording
++  path a no-op by construction (requirement: pausing a non-recording
++  session is unaffected).
++
++## Steps
++
++### Step 1 - `server/audio/wav-recorder.ts`
++
++- Add `private paused = false;`, `pause()`, `resume()`, `get isPaused()`.
++- Gate `append` at call time per the pinned contract; the enqueued op
++  body (`!this.fh || this.done` guard, write, byte count) is unchanged.
++
++### Step 2 - `server/session/manager.ts`
++
++- Wire `active.recorder?.pause()` in `pause()` and
++  `active.recorder?.resume()` in `resume()` at the positions pinned
++  above. No new fields, no signature changes.
++
++### Step 3 - tests
++
++- Extend `server/audio/wav-recorder.test.ts` and `server/app.test.ts`
++  per the test plan below.
++
++## Test plan
++
++Automated (vitest), new cases:
++
++`server/audio/wav-recorder.test.ts`:
++
++- "drops appends while paused and resumes into the same file": create ->
++  `append(A)` -> `pause()` -> `append(B)` -> `resume()` -> `append(C)`
++  -> `finalize()`. Assert file payload equals `A` followed immediately
++  by `C` (contiguous, `B` absent), RIFF size `36 + |A| + |C|`, data size
++  `|A| + |C|`, `bytesWritten === |A| + |C|`.
++- "isPaused reflects pause/resume and both are idempotent": pause twice,
++  resume twice; `isPaused` true then false; appending between the double
++  pause still drops.
++- "finalize while paused still patches and closes": create -> append ->
++  `pause()` -> `finalize()` -> header sizes patched to the pre-pause
++  byte count; a later `append` resolves as a no-op (`done` guard).
++
++`server/app.test.ts` (inside `session audio recording` describe, reusing
++FakeProvider + `wavPathFor`):
++
++- "pauses and resumes the session WAV on pause/resume": start with
++  `recordAudio: true` -> send chunk A (known bytes) -> wait
++  `provider.audio` length 1 -> `POST /pause` -> stat the `.wav`: size is
++  `44 + |A|` after a settle delay AND stays `44 + |A|` after sending
++  chunk B while paused -> `POST /resume` -> send chunk C -> wait
++  `provider.audio` length 2 -> `POST /stop` -> read the file: data size
++  `|A| + |C|`, payload equals `A ++ C` contiguous, header sizes patched.
++  This asserts same-file resume (the `wx` flag makes a second file
++  impossible anyway) and byte-level absence of the paused chunk.
++- "stop while paused finalizes a valid WAV": start with
++  `recordAudio: true` -> send A -> `POST /pause` -> send B -> `POST
++  /stop` -> file parses as WAV, data size `|A|`, payload equals A.
++- "pause/resume on a non-recording session leaves no WAV": start without
++  `recordAudio` -> `POST /pause` -> send -> `POST /resume` -> `POST
++  /stop` -> `fs.access(wavPathFor(dir, id))` rejects.
++
++Existing tests that already touch this area and must keep passing: the
++paused-drop assertion inside "recordAudio tees sent PCM into a sibling
++.wav and serves it", the `pause/resume` describe block, and "keeps cue
++start cumulative across pause/resume".
++
++Gates: `npm test`, `npm run typecheck`.
++
++## Risks and notes
++
++- Assumption (recorded per task instruction): the reported live bug
++  ("recording keeps going") does not reproduce on this tree -
++  `sendAudio` already gates on `active.paused` and the suite is green.
++  The plan treats the task as making the guarantee structural in
++  `WavRecorder` plus dedicated coverage. If the reporter's build has the
++  tee before/outside the paused check, this same change fixes that
++  shape.
++- Dual flags (`active.paused` + `recorder.paused`) are intentional: they
++  protect different sinks (provider stream vs file). They cannot diverge
++  in current call paths because both flip synchronously inside the same
++  manager calls.
++- Call-time vs in-queue paused check: pinned call-time so pre-pause
++  bytes already queued still land; an in-queue check would drop a small
++  tail of legitimately-recorded audio on every pause.
++- "No gap or corruption" is interpreted as contiguous playable PCM with
++  a correctly patched header, not as an audible gap of silence - the
++  latter would desync ADR-007 cue timestamps from playback position.
++- Follow-up (unchanged by this plan): a crash or a never-finalized
++  session leaves `dataSize: 0` in the header while bytes exist (PLAN-010
++  Risks); pause/resume does not make this better or worse.
++
++## Definition of Done
++
++- [ ] `WavRecorder` exposes `pause()`, `resume()`, `isPaused`; `append`
++  submitted while paused resolves without writing and without counting
++  toward `bytesWritten`.
++- [ ] `SessionManager.pause()` pauses the recorder;
++  `SessionManager.resume()` resumes it only after the new stream opens.
++- [ ] Resumed recording appends to the same `.wav`; the finalized file
++  is a valid PCM WAV whose data section is exactly the unpaused bytes,
++  contiguous.
++- [ ] Pause/resume on a non-recording session is a no-op for artifacts
++  (no `.wav` appears, no error).
++- [ ] New unit + end-to-end tests pass; `npm test` and
++  `npm run typecheck` are clean.
+-- 
+2.50.0
+
+
+From b8d7fae8403cf290357f3bea363ff81ae4d922c1 Mon Sep 17 00:00:00 2001
+From: Satoshi Man <mrvuong.bitcoin@gmail.com>
+Date: Thu, 5 Nov 2026 21:57:46 +0700
+Subject: [PATCH 02/17] log: draft PLAN-012 pause/resume WAV recording
+
+---
+ CONTEXTS/04-logs/2026-11-05.md | 31 +++++++++++++++++++++++++++++--
+ 1 file changed, 29 insertions(+), 2 deletions(-)
+
+diff --git a/CONTEXTS/04-logs/2026-11-05.md b/CONTEXTS/04-logs/2026-11-05.md
+index a251d67..a9c5c06 100644
+--- a/CONTEXTS/04-logs/2026-11-05.md
++++ b/CONTEXTS/04-logs/2026-11-05.md
+@@ -1,11 +1,11 @@
+ ---
+ date: "2026-11-05"
+-events_count: 88
++events_count: 89
+ ---
+ 
+ # Events on 2026-11-05
+ 
+-Total events: **88**
++Total events: **89**
+ 
+ ## Table of contents
+ 
+@@ -97,6 +97,7 @@ Total events: **88**
+ - [17:56 - Add README and MIT license](#1756---add-readme-and-mit-license)
+ - [17:58 - Update license copyright to real name](#1758---update-license-copyright-to-real-name)
+ - [18:31 - Standardize workflow name in README](#1831---standardize-workflow-name-in-readme)
++- [21:57 - Draft PLAN-012 pause/resume WAV recording](#2157---draft-plan-012-pauseresume-wav-recording)
+ 
+ ---
+ 
+@@ -3124,3 +3125,29 @@ README.md
+ None
+ 
+ ---
++## 21:57 - Draft PLAN-012 pause/resume WAV recording
++
++**Scope:** CONTEXTS/03-implement-plan | **Type:** Docs
++
++## Scope
++CONTEXTS/03-implement-plan
++
++## Type
++Docs
++
++## User request
++plan: pause/resume for session WAV recording; draft only, no implementation
++
++## Reason
++Pause must produce zero WAV bytes to keep ADR-007 cue times aligned with audio positions; making the invariant structural in the recorder instead of incidental at one call site.
++
++## Description
++Drafted plan to move the no-append-while-paused invariant into WavRecorder (pause/resume/isPaused), wire it from SessionManager pause/resume, and add dedicated unit + e2e tests. Verified the symptom does not reproduce: sendAudio already gates on active.paused.
++
++## Files changed
++None
++
++## Notes
++None
++
++---
+-- 
+2.50.0
+
+
+From 13c148a4bc4a7a02ab80315b68a18d3e61c1d90a Mon Sep 17 00:00:00 2001
+From: Satoshi Man <mrvuong.bitcoin@gmail.com>
+Date: Thu, 5 Nov 2026 22:01:10 +0700
+Subject: [PATCH 03/17] Review pass 1 on PLAN-012: patch flaky-test divergence
+
+---
+ .../PLAN-012-pause-resume-wav-recording.md         | 14 +++++++++++---
+ 1 file changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/CONTEXTS/03-implement-plan/PLAN-012-pause-resume-wav-recording.md b/CONTEXTS/03-implement-plan/PLAN-012-pause-resume-wav-recording.md
+index 969c8d7..2034ac7 100644
+--- a/CONTEXTS/03-implement-plan/PLAN-012-pause-resume-wav-recording.md
++++ b/CONTEXTS/03-implement-plan/PLAN-012-pause-resume-wav-recording.md
+@@ -2,8 +2,8 @@
+ id: PLAN-012-pause-resume-wav-recording
+ status: draft
+ date: 2026-11-05
+-review_count: 0
+-patch: n/a
++review_count: 1
++patch: applied
+ ---
+ 
+ # PLAN-012: Pause/resume for session WAV recording
+@@ -19,7 +19,8 @@ audio appended while paused, resume keeps writing to the same file, the
+ file stays valid, non-recording sessions are unaffected, and automated
+ tests cover the behavior.
+ 
+-Verification against the current tree (all 145 tests pass): `sendAudio`
++Verification against the current tree (145 tests; green except for one
++flaky timestamp assertion, see Risks): `sendAudio`
+ in `server/session/manager.ts` already returns early when
+ `active.paused`, so paused PCM never reaches `WavRecorder.append`, and
+ the existing `session audio recording` test in `server/app.test.ts`
+@@ -215,6 +216,13 @@ Gates: `npm test`, `npm run typecheck`.
+ - Follow-up (unchanged by this plan): a crash or a never-finalized
+   session leaves `dataSize: 0` in the header while bytes exist (PLAN-010
+   Risks); pause/resume does not make this better or worse.
++- Pre-existing test flake (observed during review pass 1): `REST + WS
++  surface > full session lifecycle` asserts exact millisecond cue times
++  (`00:00:01,000 --> 00:00:02,000`) that can drift by 1 ms because
++  `streamBaseS` is wall-clock. It failed once under load and passes on
++  re-run; it is unrelated to this plan. If `npm test` reds only there,
++  re-run before treating the gate as failed. Tightening that assertion
++  (e.g. a tolerance or a fake clock) is a separate fix.
+ 
+ ## Definition of Done
+ 
+-- 
+2.50.0
+
+
+From f72a3236b5bd04924209f020c2026a3e13b1de02 Mon Sep 17 00:00:00 2001
+From: Satoshi Man <mrvuong.bitcoin@gmail.com>
+Date: Thu, 5 Nov 2026 22:01:15 +0700
+Subject: [PATCH 04/17] log: review pass 1 on PLAN-012
+
+---
+ CONTEXTS/04-logs/2026-11-05.md | 31 +++++++++++++++++++++++++++++--
+ 1 file changed, 29 insertions(+), 2 deletions(-)
+
+diff --git a/CONTEXTS/04-logs/2026-11-05.md b/CONTEXTS/04-logs/2026-11-05.md
+index a9c5c06..bb9a70d 100644
+--- a/CONTEXTS/04-logs/2026-11-05.md
++++ b/CONTEXTS/04-logs/2026-11-05.md
+@@ -1,11 +1,11 @@
+ ---
+ date: "2026-11-05"
+-events_count: 89
++events_count: 90
+ ---
+ 
+ # Events on 2026-11-05
+ 
+-Total events: **89**
++Total events: **90**
+ 
+ ## Table of contents
+ 
+@@ -98,6 +98,7 @@ Total events: **89**
+ - [17:58 - Update license copyright to real name](#1758---update-license-copyright-to-real-name)
+ - [18:31 - Standardize workflow name in README](#1831---standardize-workflow-name-in-readme)
+ - [21:57 - Draft PLAN-012 pause/resume WAV recording](#2157---draft-plan-012-pauseresume-wav-recording)
++- [22:01 - Review pass 1 on PLAN-012 pause/resume WAV recording](#2201---review-pass-1-on-plan-012-pauseresume-wav-recording)
+ 
+ ---
+ 
+@@ -3151,3 +3152,29 @@ None
+ None
+ 
+ ---
++## 22:01 - Review pass 1 on PLAN-012 pause/resume WAV recording
++
++**Scope:** CONTEXTS/03-implement-plan | **Type:** Docs
++
++## Scope
++CONTEXTS/03-implement-plan
++
++## Type
++Docs
++
++## User request
++Run ONE verification pass on the newest PLAN in CONTEXTS/03-implement-plan/ per AGENTS.md workflow: re-check against BDRs, ADRs, and the codebase; patch divergences; update review_count and patch frontmatter. Do not implement. Commit only plan changes.
++
++## Reason
++AGENTS.md workflow requires at least one verification pass before a plan may be implemented; the pass found the suite-green claim overstated due to a known-flaky timing test, patched in place.
++
++## Description
++Ran one verification pass on PLAN-012 against BDRs, ADRs, and the codebase. All structural claims verified: sendAudio gates on active.paused, WavRecorder lacks pause, pinned wiring points in SessionManager.pause/resume match, wx flag and wavPathFor confirmed, all referenced tests exist, npm run typecheck clean. One divergence found and patched: the Context claim 'all 145 tests pass' is unreliable because REST + WS surface > full session lifecycle has a flaky 1ms timestamp assertion (streamBaseS is wall-clock); qualified the claim and added a Risks note. Frontmatter updated to review_count: 1, patch: applied. Plan remains draft; not implemented.
++
++## Files changed
++CONTEXTS/03-implement-plan/PLAN-012-pause-resume-wav-recording.md
++
++## Notes
++Flaky timestamp assertion in app.test.ts lifecycle test may intermittently red the npm test gate; tightening it is a separate fix.
++
++---
+-- 
+2.50.0
+
+
+From d1f994899a7bdbd6486911fac469cf244a282b11 Mon Sep 17 00:00:00 2001
+From: Satoshi Man <mrvuong.bitcoin@gmail.com>
+Date: Thu, 5 Nov 2026 22:03:10 +0700
+Subject: [PATCH 05/17] Implement PLAN-012: pause/resume for session WAV
+ recording
+
+---
+ .../PLAN-012-pause-resume-wav-recording.md    |  14 +--
+ server/app.test.ts                            | 115 ++++++++++++++++++
+ server/audio/wav-recorder.test.ts             |  52 ++++++++
+ server/audio/wav-recorder.ts                  |  14 +++
+ server/session/manager.ts                     |   2 +
+ 5 files changed, 190 insertions(+), 7 deletions(-)
+
+diff --git a/CONTEXTS/03-implement-plan/PLAN-012-pause-resume-wav-recording.md b/CONTEXTS/03-implement-plan/PLAN-012-pause-resume-wav-recording.md
+index 2034ac7..617f3b2 100644
+--- a/CONTEXTS/03-implement-plan/PLAN-012-pause-resume-wav-recording.md
++++ b/CONTEXTS/03-implement-plan/PLAN-012-pause-resume-wav-recording.md
+@@ -1,6 +1,6 @@
+ ---
+ id: PLAN-012-pause-resume-wav-recording
+-status: draft
++status: implemented
+ date: 2026-11-05
+ review_count: 1
+ patch: applied
+@@ -10,7 +10,7 @@ patch: applied
+ 
+ ## Status
+ 
+-draft
++implemented
+ 
+ ## Context
+ 
+@@ -226,15 +226,15 @@ Gates: `npm test`, `npm run typecheck`.
+ 
+ ## Definition of Done
+ 
+-- [ ] `WavRecorder` exposes `pause()`, `resume()`, `isPaused`; `append`
++- [x] `WavRecorder` exposes `pause()`, `resume()`, `isPaused`; `append`
+   submitted while paused resolves without writing and without counting
+   toward `bytesWritten`.
+-- [ ] `SessionManager.pause()` pauses the recorder;
++- [x] `SessionManager.pause()` pauses the recorder;
+   `SessionManager.resume()` resumes it only after the new stream opens.
+-- [ ] Resumed recording appends to the same `.wav`; the finalized file
++- [x] Resumed recording appends to the same `.wav`; the finalized file
+   is a valid PCM WAV whose data section is exactly the unpaused bytes,
+   contiguous.
+-- [ ] Pause/resume on a non-recording session is a no-op for artifacts
++- [x] Pause/resume on a non-recording session is a no-op for artifacts
+   (no `.wav` appears, no error).
+-- [ ] New unit + end-to-end tests pass; `npm test` and
++- [x] New unit + end-to-end tests pass; `npm test` and
+   `npm run typecheck` are clean.
+diff --git a/server/app.test.ts b/server/app.test.ts
+index 3489e77..8b7fadf 100644
+--- a/server/app.test.ts
++++ b/server/app.test.ts
+@@ -444,6 +444,121 @@ describe('session audio recording', () => {
+     ws.close();
+   });
+ 
++  it('pauses and resumes the session WAV on pause/resume', async () => {
++    const res = await app.inject({
++      method: 'POST',
++      url: '/api/sessions',
++      payload: { diarize: true, recordAudio: true },
++    });
++    expect(res.statusCode).toBe(201);
++    const info = res.json() as { id: string };
++
++    const { ws, messages } = connectWs();
++    await vi.waitFor(() => expect(messages.length).toBeGreaterThan(0));
++
++    const a = Buffer.alloc(160, 0xa1);
++    const b = Buffer.alloc(64, 0xb2);
++    const c = Buffer.alloc(96, 0xc3);
++    ws.send(a);
++    await vi.waitFor(() => expect(provider.audio.length).toBe(1));
++
++    const wav = wavPathFor(dir, info.id);
++    await app.inject({ method: 'POST', url: `/api/sessions/${info.id}/pause` });
++    // settle so the queued append lands before sizing the file
++    await new Promise((r) => setTimeout(r, 150));
++    expect((await fs.stat(wav)).size).toBe(44 + a.length);
++
++    ws.send(b);
++    await new Promise((r) => setTimeout(r, 150));
++    expect(provider.audio.length).toBe(1);
++    expect((await fs.stat(wav)).size).toBe(44 + a.length);
++
++    await app.inject({
++      method: 'POST',
++      url: `/api/sessions/${info.id}/resume`,
++    });
++    ws.send(c);
++    await vi.waitFor(() => expect(provider.audio.length).toBe(2));
++
++    const stop = await app.inject({
++      method: 'POST',
++      url: `/api/sessions/${info.id}/stop`,
++    });
++    expect(stop.statusCode).toBe(200);
++
++    const buf = await fs.readFile(wav);
++    const pcmBytes = a.length + c.length;
++    expect(buf.length).toBe(44 + pcmBytes);
++    expect(buf.readUInt32LE(4)).toBe(36 + pcmBytes);
++    expect(buf.readUInt32LE(40)).toBe(pcmBytes);
++    expect(buf.subarray(44)).toEqual(Buffer.concat([a, c]));
++
++    ws.close();
++  });
++
++  it('stop while paused finalizes a valid WAV', async () => {
++    const res = await app.inject({
++      method: 'POST',
++      url: '/api/sessions',
++      payload: { diarize: true, recordAudio: true },
++    });
++    expect(res.statusCode).toBe(201);
++    const info = res.json() as { id: string };
++
++    const { ws, messages } = connectWs();
++    await vi.waitFor(() => expect(messages.length).toBeGreaterThan(0));
++
++    const a = Buffer.alloc(120, 0x0a);
++    ws.send(a);
++    await vi.waitFor(() => expect(provider.audio.length).toBe(1));
++
++    await app.inject({ method: 'POST', url: `/api/sessions/${info.id}/pause` });
++    ws.send(Buffer.alloc(50, 0x0b));
++    await new Promise((r) => setTimeout(r, 150));
++    expect(provider.audio.length).toBe(1);
++
++    const stop = await app.inject({
++      method: 'POST',
++      url: `/api/sessions/${info.id}/stop`,
++    });
++    expect(stop.statusCode).toBe(200);
++
++    const buf = await fs.readFile(wavPathFor(dir, info.id));
++    expect(buf.subarray(0, 4).toString('ascii')).toBe('RIFF');
++    expect(buf.length).toBe(44 + a.length);
++    expect(buf.readUInt32LE(4)).toBe(36 + a.length);
++    expect(buf.readUInt32LE(40)).toBe(a.length);
++    expect(buf.subarray(44)).toEqual(a);
++
++    ws.close();
++  });
++
++  it('pause/resume on a non-recording session leaves no WAV', async () => {
++    const res = await app.inject({
++      method: 'POST',
++      url: '/api/sessions',
++      payload: { diarize: true },
++    });
++    expect(res.statusCode).toBe(201);
++    const info = res.json() as { id: string };
++
++    const { ws, messages } = connectWs();
++    await vi.waitFor(() => expect(messages.length).toBeGreaterThan(0));
++
++    await app.inject({ method: 'POST', url: `/api/sessions/${info.id}/pause` });
++    ws.send(Buffer.alloc(32, 0x55));
++    await new Promise((r) => setTimeout(r, 150));
++    expect(provider.audio.length).toBe(0);
++    await app.inject({
++      method: 'POST',
++      url: `/api/sessions/${info.id}/resume`,
++    });
++    await app.inject({ method: 'POST', url: `/api/sessions/${info.id}/stop` });
++
++    await expect(fs.access(wavPathFor(dir, info.id))).rejects.toThrow();
++    ws.close();
++  });
++
+   it('404s the audio route when recording was off', async () => {
+     const res = await app.inject({
+       method: 'POST',
+diff --git a/server/audio/wav-recorder.test.ts b/server/audio/wav-recorder.test.ts
+index b3007aa..c750620 100644
+--- a/server/audio/wav-recorder.test.ts
++++ b/server/audio/wav-recorder.test.ts
+@@ -72,4 +72,56 @@ describe('WavRecorder', () => {
+     await fs.writeFile(wavPath(), 'occupied');
+     await expect(WavRecorder.create(wavPath())).rejects.toThrow();
+   });
++
++  it('drops appends while paused and resumes into the same file', async () => {
++    const rec = await WavRecorder.create(wavPath());
++    const a = Buffer.alloc(100, 0x01);
++    const b = Buffer.alloc(50, 0x02);
++    const c = Buffer.alloc(80, 0x03);
++    await rec.append(a);
++    rec.pause();
++    await rec.append(b);
++    rec.resume();
++    await rec.append(c);
++    expect(rec.bytesWritten).toBe(180);
++    await rec.finalize();
++
++    const buf = await fs.readFile(wavPath());
++    expect(buf.length).toBe(44 + 180);
++    expect(buf.readUInt32LE(4)).toBe(36 + 180);
++    expect(buf.readUInt32LE(40)).toBe(180);
++    expect(buf.subarray(44)).toEqual(Buffer.concat([a, c]));
++  });
++
++  it('isPaused reflects pause/resume and both are idempotent', async () => {
++    const rec = await WavRecorder.create(wavPath());
++    expect(rec.isPaused).toBe(false);
++    rec.pause();
++    rec.pause();
++    expect(rec.isPaused).toBe(true);
++    await rec.append(Buffer.alloc(10, 0x07));
++    expect(rec.bytesWritten).toBe(0);
++    rec.resume();
++    rec.resume();
++    expect(rec.isPaused).toBe(false);
++    await rec.append(Buffer.alloc(10, 0x07));
++    expect(rec.bytesWritten).toBe(10);
++    await rec.abort();
++  });
++
++  it('finalize while paused still patches and closes', async () => {
++    const rec = await WavRecorder.create(wavPath());
++    await rec.append(Buffer.alloc(64, 0x09));
++    rec.pause();
++    await rec.finalize();
++
++    const buf = await fs.readFile(wavPath());
++    expect(buf.length).toBe(44 + 64);
++    expect(buf.readUInt32LE(4)).toBe(36 + 64);
++    expect(buf.readUInt32LE(40)).toBe(64);
++
++    rec.resume();
++    await rec.append(Buffer.alloc(10, 0x01));
++    expect(rec.bytesWritten).toBe(64);
++  });
+ });
+diff --git a/server/audio/wav-recorder.ts b/server/audio/wav-recorder.ts
+index f9dbb4b..2a28b59 100644
+--- a/server/audio/wav-recorder.ts
++++ b/server/audio/wav-recorder.ts
+@@ -40,6 +40,7 @@ export class WavRecorder {
+   private fh: FileHandle | null = null;
+   private payloadBytes = 0;
+   private done = false;
++  private paused = false;
+ 
+   private constructor(
+     private readonly filePath: string,
+@@ -63,6 +64,7 @@ export class WavRecorder {
+   }
+ 
+   append(chunk: Buffer): Promise<void> {
++    if (this.paused) return Promise.resolve();
+     return this.enqueue(async () => {
+       if (!this.fh || this.done) return;
+       await this.fh.write(chunk);
+@@ -74,6 +76,18 @@ export class WavRecorder {
+     return this.payloadBytes;
+   }
+ 
++  pause(): void {
++    this.paused = true;
++  }
++
++  resume(): void {
++    this.paused = false;
++  }
++
++  get isPaused(): boolean {
++    return this.paused;
++  }
++
+   async finalize(): Promise<void> {
+     await this.enqueue(async () => {
+       if (!this.fh || this.done) return;
+diff --git a/server/session/manager.ts b/server/session/manager.ts
+index 7035d0c..b22ea05 100644
+--- a/server/session/manager.ts
++++ b/server/session/manager.ts
+@@ -288,6 +288,7 @@ export class SessionManager {
+     active.paused = true;
+     active.pausedAtMs = Date.now();
+     active.info.paused = true;
++    active.recorder?.pause();
+     try {
+       active.stream.close();
+     } catch {
+@@ -305,6 +306,7 @@ export class SessionManager {
+     active.pausedTotalMs += Date.now() - active.pausedAtMs;
+     active.paused = false;
+     active.info.paused = false;
++    active.recorder?.resume();
+     this.broadcast({ type: 'session', state: 'active', session: active.info });
+   }
+ 
+-- 
+2.50.0
+
+
+From fb63e9cb0c0d6849847d1c2fa4afe3858d6fca21 Mon Sep 17 00:00:00 2001
+From: Satoshi Man <mrvuong.bitcoin@gmail.com>
+Date: Thu, 5 Nov 2026 22:03:29 +0700
+Subject: [PATCH 06/17] log: implement PLAN-012 pause/resume WAV recording
+
+---
+ CONTEXTS/04-logs/2026-11-05.md | 42 ++++++++++++++++++++++++++++++++--
+ 1 file changed, 40 insertions(+), 2 deletions(-)
+
+diff --git a/CONTEXTS/04-logs/2026-11-05.md b/CONTEXTS/04-logs/2026-11-05.md
+index bb9a70d..1377eea 100644
+--- a/CONTEXTS/04-logs/2026-11-05.md
++++ b/CONTEXTS/04-logs/2026-11-05.md
+@@ -1,11 +1,11 @@
+ ---
+ date: "2026-11-05"
+-events_count: 90
++events_count: 91
+ ---
+ 
+ # Events on 2026-11-05
+ 
+-Total events: **90**
++Total events: **91**
+ 
+ ## Table of contents
+ 
+@@ -99,6 +99,7 @@ Total events: **90**
+ - [18:31 - Standardize workflow name in README](#1831---standardize-workflow-name-in-readme)
+ - [21:57 - Draft PLAN-012 pause/resume WAV recording](#2157---draft-plan-012-pauseresume-wav-recording)
+ - [22:01 - Review pass 1 on PLAN-012 pause/resume WAV recording](#2201---review-pass-1-on-plan-012-pauseresume-wav-recording)
++- [22:03 - Pause/resume support for session WAV recording](#2203---pauseresume-support-for-session-wav-recording)
+ 
+ ---
+ 
+@@ -3178,3 +3179,40 @@ CONTEXTS/03-implement-plan/PLAN-012-pause-resume-wav-recording.md
+ Flaky timestamp assertion in app.test.ts lifecycle test may intermittently red the npm test gate; tightening it is a separate fix.
+ 
+ ---
++## 22:03 - Pause/resume support for session WAV recording
++
++**Scope:** server/audio, server/session | **Type:** Fix | **Commit:** d1f9948 @ work
++
++## Scope
++server/audio, server/session
++
++## Type
++Fix
++
++## Commit
++- **Hash:** d1f9948
++- **Repo:** work
++- **Message:** Implement PLAN-012: pause/resume for session WAV recording
++- **Author:** Satoshi Man <mrvuong.bitcoin@gmail.com>
++- **Date:** 2026-11-05 22:03:10 +0700
++
++## User request
++Implement PLAN-012: pausing a session must also pause its WAV recording; resume keeps writing to the same file; non-recording sessions unaffected; automated tests cover the behavior.
++
++## Reason
++The no-append-during-pause invariant previously lived only at the sendAudio call site; moving it into WavRecorder makes the guarantee structural so future append paths or regressions cannot silently record paused audio. Per ADR-007, paused time must produce zero WAV bytes (drop, not silence) to keep cue timestamps aligned.
++
++## Description
++WavRecorder gained pause()/resume()/isPaused; append() drops chunks submitted while paused at call time so queued pre-pause bytes still land. SessionManager.pause()/resume() drive the recorder flag (resume only after the new STT stream opens). Added 3 unit tests in wav-recorder.test.ts and 3 end-to-end cases in app.test.ts covering same-file resume, stop-while-paused finalize, and non-recording sessions. PLAN-012 marked implemented with all DoD items checked.
++
++## Files changed
++CONTEXTS/03-implement-plan/PLAN-012-pause-resume-wav-recording.md
++server/app.test.ts
++server/audio/wav-recorder.test.ts
++server/audio/wav-recorder.ts
++server/session/manager.ts
++
++## Notes
++151 tests pass, tsc clean. Pre-existing flaky ms-level cue assertion in 'full session lifecycle' is unrelated (PLAN-012 Risks). Follow-up: unfinalized WAV headers still report dataSize 0 (PLAN-010 Risks).
++
++---
+-- 
+2.50.0
+
+
+From 25161e551b66f5420f219a7dd9ab09b2beab1066 Mon Sep 17 00:00:00 2001
+From: Satoshi Man <mrvuong.bitcoin@gmail.com>
+Date: Thu, 5 Nov 2026 22:08:08 +0700
+Subject: [PATCH 07/17] Draft PLAN-013: WAV recording size cap with rotation
+
+---
+ .../PLAN-013-wav-size-cap-rotation.md         | 331 ++++++++++++++++++
+ 1 file changed, 331 insertions(+)
+ create mode 100644 CONTEXTS/03-implement-plan/PLAN-013-wav-size-cap-rotation.md
+
+diff --git a/CONTEXTS/03-implement-plan/PLAN-013-wav-size-cap-rotation.md b/CONTEXTS/03-implement-plan/PLAN-013-wav-size-cap-rotation.md
+new file mode 100644
+index 0000000..07b0e6d
+--- /dev/null
++++ b/CONTEXTS/03-implement-plan/PLAN-013-wav-size-cap-rotation.md
+@@ -0,0 +1,331 @@
++---
++id: PLAN-013-wav-size-cap-rotation
++status: draft
++date: 2026-11-05
++review_count: 0
++patch: n/a
++---
++
++# PLAN-013: WAV recording size cap with rotation
++
++## Status
++
++draft
++
++## Context
++
++Session WAV recording (PLAN-010, PLAN-012) appends the same linear16 PCM
++that goes to the STT stream into a single `<stem>.wav` sibling. Long
++sessions grow that file without bound: at ~115 MB/hour of uncompressed
++16 kHz mono audio, a multi-hour session produces files that are awkward
++to store, copy, and open.
++
++The task asks for a configurable maximum file size (env or config,
++default 500 MB). When the cap is reached the current file is finalized
++and recording continues into a new file instead of stopping the session.
++Rotated names must make ordering obvious; every rotated file must be a
++valid playable WAV; and tests must cover rotation without writing
++hundreds of MB, so the cap must be injectable at a fine granularity.
++
++## Governing records
++
++- BDR-006: session audio is retained as a sibling WAV in the one-stem
++  bundle (`<stem>.md` / `<stem>.srt` / `<stem>.wav`). Rotation keeps the
++  first part at exactly `<stem>.wav`; additional parts are additive
++  siblings named `<stem>.part-NNN.wav`. See Risks for the bundle-shape
++  assumption.
++- ADR-007: the `.wav` path and the `audio_file` frontmatter key are
++  unchanged: `wavPathFor` still returns the part-1 path and `audio_file`
++  still holds its basename. The read path (`GET
++  /api/sessions/:id/audio`) continues to serve part 1.
++- ADR-005: tunables come from environment variables only, loaded through
++  `envSchema` in `server/config.ts` and documented in `.env.example`.
++  The cap follows that convention (`WAV_MAX_FILE_MB`); there is no
++  in-app settings surface.
++- ADR-006 / BDR-002: no new dependencies. Rotation is `node:fs/promises`
++  plus arithmetic inside the existing recorder.
++- ADR-001: the backend owns filesystem artifacts; the change lives in
++  `server/`. No web change is required.
++- PLAN-012: pause/resume semantics are preserved - dropped appends never
++  reach the write queue, so paused audio can neither land in a part nor
++  trigger a rotation.
++
++## Scope
++
++In scope:
++
++1. `server/config.ts`: new `WAV_MAX_FILE_MB` env var, default 500.
++2. `.env.example`: document the new variable.
++3. `server/audio/wav-recorder.ts`: `maxBytes` option on `WavRecorder`,
++   rotation into `<stem>.part-NNN.wav` parts, `partPaths` / `partCount`
++   getters, multi-part `abort()` cleanup.
++4. `server/session/manager.ts`: resolve the cap (config default or
++   `SessionManagerDeps.wavMaxBytes` test seam) and pass it to
++   `WavRecorder.create`.
++5. Automated tests: `server/audio/wav-recorder.test.ts`,
++   `server/config.test.ts`, `server/app.test.ts`.
++
++Out of scope:
++
++- Serving rotated parts over HTTP: `GET /api/sessions/:id/audio` keeps
++  returning part 1 (`<stem>.wav`). Multi-part playback/concatenation in
++  the Review page is a follow-up; the files are independently playable
++  on disk, which is what the task requires.
++- Frontmatter schema changes (`audio_files` list, part count). `audio_file`
++  keeps pointing at part 1 so `store.ts`, `routes.ts`, and the web types
++  are untouched.
++- Client-side (`web/`) changes of any kind.
++- Migrating or capping already-recorded sessions.
++
++## Contracts (literal)
++
++### `server/config.ts`
++
++```ts
++WAV_MAX_FILE_MB: z.coerce.number().int().positive().default(500),
++```
++
++- Placed in `envSchema` next to `STT_IDLE_TIMEOUT_S` (same
++  unit-suffixed naming convention).
++- The value is a whole number of mebibytes; byte-level caps for tests
++  come through the `wavMaxBytes` dep, not the env var.
++
++### `server/audio/wav-recorder.ts`
++
++```ts
++export interface WavRecorderOptions {
++  sampleRate?: number;
++  channels?: number;
++  bitsPerSample?: number;
++  maxBytes?: number; // max on-disk bytes per part, including the 44-byte header
++}
++
++// WavRecorder
++get partPaths(): readonly string[]; // every part created so far, in order
++get partCount(): number;            // === partPaths.length
++```
++
++Pinned semantics:
++
++- Part naming, pinned exactly (part 1 keeps the ADR-007 bundle name):
++
++  ```ts
++  function partPathFor(filePath: string, part: number): string {
++    if (part === 1) return filePath;
++    const stem = filePath.replace(/\.wav$/i, '');
++    return `${stem}.part-${String(part).padStart(3, '0')}.wav`;
++  }
++  ```
++
++  So `session.wav` rotates into `session.part-002.wav`,
++  `session.part-003.wav`, ... Ordering is obvious to a reader: the bare
++  stem is part 1, the numeric suffix counts up from there. Each part is
++  opened with the same `wx` flag, so a name collision fails loudly
++  rather than clobbering.
++- `maxBytes` bounds total on-disk size per part, header included, so the
++  PCM payload capacity per part is `maxBytes - HEADER_SIZE`. Every
++  produced file is `<= maxBytes` bytes. `maxBytes: undefined` disables
++  rotation entirely (single file, current behavior).
++- Validation: `create` throws a `RangeError` when `maxBytes` is defined
++  and `< HEADER_SIZE + blockAlign` (46 bytes for the default format) -
++  a cap that cannot hold one sample frame is a config bug, and failing
++  the session start is more honest than recording nothing.
++- Writes split at sample boundaries, never mid-sample. The enqueued
++  append op loops over the chunk: `room = payloadCap - payloadBytes`;
++  if `room < blockAlign`, rotate first (finalize current part, open the
++  next, reset `payloadBytes`); then write
++  `min(view.length, floor(room / blockAlign) * blockAlign)` bytes and
++  repeat. Every part payload is therefore a multiple of `blockAlign`
++  and `<= payloadCap`.
++- Rotation runs inside the same serialized op as the write, on the
++  existing queue: a rotate can never interleave with another append or
++  with `finalize`/`abort`.
++- Rotating finalizes the previous part fully (RIFF/data sizes patched,
++  handle closed) before the next part is opened, so at most one part is
++  ever open and every completed part is a valid standalone WAV.
++- `bytesWritten` keeps its meaning: total PCM payload bytes written,
++  summed across all parts. Dropped (paused) appends still count
++  nothing.
++- `pause()` / `resume()` / `isPaused` are unchanged: the call-time
++  `paused` gate drops chunks before enqueueing, so paused audio can
++  never trigger a rotation.
++- `finalize()` patches and closes only the current part (earlier parts
++  were already finalized at rotation) and stays idempotent.
++- `abort()` closes the current handle and unlinks every path in
++  `partPaths`, not just the base file - no orphaned parts after a
++  failed session start.
++- A rotation-time fs failure (disk full, `wx` collision) rejects the
++  `append` promise. `SessionManager.sendAudio` already treats any
++  append rejection as `recorderFailed` and continues the session
++  unrecorded; parts finalized before the failure remain valid files.
++
++### `server/session/manager.ts`
++
++- `SessionManagerDeps` gains `wavMaxBytes?: number` - the same kind of
++  test seam as `providerFactory` et al. `buildServer(config, deps)`
++  forwards it untouched, so `app.test.ts` can inject a tiny cap.
++- The manager stores the deps object and resolves the cap lazily inside
++  `start()` (not in the constructor) so a test may mutate
++  `deps.wavMaxBytes` after `buildServer` but before `POST
++  /api/sessions`:
++
++  ```ts
++  const maxBytes =
++    deps.wavMaxBytes ?? this.config.WAV_MAX_FILE_MB * 1024 * 1024;
++  recorder = await WavRecorder.create(wavPath, { maxBytes });
++  ```
++
++- `meta.audio_file` keeps `path.basename(wavPath)` (part 1). `finish()`
++  keeps calling `recorder.finalize()` once; the recorder finalizes
++  whichever part is open.
++- `sendAudio`, `pause`, `resume` need no changes.
++
++### `.env.example`
++
++Add after the `STT_IDLE_TIMEOUT_S` block:
++
++```
++# WAV recording rotation: maximum size per .wav file (MiB) before the
++# recorder finalizes it and continues into <stem>.part-NNN.wav siblings.
++WAV_MAX_FILE_MB=500
++```
++
++## Steps
++
++### Step 1 - `server/config.ts` + `.env.example`
++
++- Add `WAV_MAX_FILE_MB` to `envSchema` per the contract above.
++- Add the documented block to `.env.example`.
++
++### Step 2 - `server/audio/wav-recorder.ts`
++
++- Extend `WavRecorderOptions` with `maxBytes`; validate it in `create`.
++- Track `partPaths: string[]`, `payloadBytes` per part, `totalBytes`
++  across parts; `bytesWritten` returns `totalBytes`.
++- Implement the split/rotate write loop inside the existing enqueued
++  op; extract the shared "patch sizes + close" logic so both rotation
++  and `finalize()` use it.
++- `partPaths` / `partCount` getters; `abort()` unlinks all parts.
++
++### Step 3 - `server/session/manager.ts`
++
++- Add `wavMaxBytes?: number` to `SessionManagerDeps`; retain the deps
++  object on the instance.
++- In `start()`, resolve and pass `maxBytes` to `WavRecorder.create` per
++  the contract above.
++
++### Step 4 - tests
++
++- Extend `server/audio/wav-recorder.test.ts`, `server/config.test.ts`,
++  and `server/app.test.ts` per the test plan.
++
++## Test plan
++
++Automated (vitest), new cases; caps are injected in bytes so nothing
++writes more than a few hundred bytes.
++
++`server/audio/wav-recorder.test.ts`:
++
++- "rotates into part files that each stay under the cap": `maxBytes`
++  set so payload capacity is 100 bytes (`maxBytes = 144`); append 250
++  bytes in several chunks; assert `clip.wav`, `clip.part-002.wav`,
++  `clip.part-003.wav` exist, each parses as a WAV (RIFF/WAVE/fmt/data
++  markers), each header's patched sizes match its real payload
++  (`readUInt32LE(40)`), each file is `<= maxBytes` long, and the
++  concatenated payloads equal the appended stream in order.
++- "splits a single oversize chunk at the cap boundary": one 250-byte
++  append with payload cap 100 produces parts of exactly 100, 100, and
++  50 payload bytes; `bytesWritten === 250`.
++- "keeps parts sample-aligned when the cap is not a multiple of
++  blockAlign": payload cap 101 with default format (blockAlign 2)
++  produces part payloads of 100, never 101.
++- "partPaths / partCount reflect rotation order": after two rotations,
++  `partCount === 3` and `partPaths` lists base then `.part-002` then
++  `.part-003`; with no `maxBytes`, `partCount === 1` and
++  `partPaths === [filePath]`.
++- "paused appends neither count toward the cap nor trigger rotation":
++  pause, append a chunk larger than the cap, resume, append within the
++  cap - still one part.
++- "abort removes every rotated part": append past the cap, abort, all
++  paths in `partPaths` are gone.
++- "rejects a cap too small to hold one frame":
++  `create(path, { maxBytes: 45 })` rejects (RangeError).
++
++`server/config.test.ts`:
++
++- `WAV_MAX_FILE_MB` defaults to 500 when unset; coerces a string value
++  (`'250'` -> 250); rejects `0`, negative, and non-numeric values.
++
++`server/app.test.ts` (in the `session audio recording` describe):
++
++- "rotates the session WAV when the cap is reached": `beforeEach` is
++  adjusted to hold the `SessionManagerDeps` object in a variable the
++  test can mutate; the test sets `deps.wavMaxBytes` (e.g. 300 -> 256
++  bytes of payload room) after `buildServer`, starts a session with
++  `recordAudio: true`, sends ~600 bytes of PCM in a few chunks, waits
++  for `provider.audio`, then asserts: `wavPathFor(dir, id)` exists and
++  is a valid size-patched WAV `<= wavMaxBytes`, the sibling
++  `.part-002.wav` exists and is a valid size-patched WAV, concatenated
++  payloads equal the sent bytes, `POST /stop` succeeds (the session is
++  not torn down by rotation), and `meta.audio_file` still names the
++  base `.wav` while `GET /api/sessions/:id/audio` still serves part 1.
++
++Existing tests that must keep passing: all of
++`wav-recorder.test.ts` (no-`maxBytes` path is the old single-file
++behavior), the `session audio recording` describe, and the full suite.
++
++Gates: `npm test`, `npm run typecheck`.
++
++## Risks and notes
++
++- Assumption (recorded per task instruction): the ADR-007 bundle is a
++  three-file `<stem>` contract and this plan adds a fourth+ file shape
++  (`<stem>.part-NNN.wav`) when a session actually rotates. This is
++  treated as an additive extension within the task's scope; naming part
++  1 `<stem>.part-001.wav` instead was considered and rejected because it
++  renames the pinned `<stem>.wav` artifact and would ripple into
++  `wavPathFor`, `audio_file`, the audio route, and existing tests. If
++  the owner wants multi-part bundles formalized, that is a candidate
++  for a new ADR - flagged rather than silently violated, per the
++  precedence rule.
++- Assumption: "maximum file size" is enforced as a hard cap including
++  the 44-byte header, so every file is `<= maxBytes`; chunks are split
++  at `blockAlign` boundaries rather than letting a file overshoot the
++  cap by up to one chunk. A part can end a few bytes under the cap when
++  the cap is not sample-aligned.
++- Assumption: the unit is MiB (`* 1024 * 1024`) consistent with the
++  "~115 MB/hour" figure in BDR-005/BDR-006 context.
++- Lexicographic caveat: `session.part-002.wav` sorts before
++  `session.wav` in a plain directory listing (`p` < `w`). Ordering is
++  still obvious from the names (bare stem = part 1, suffix counts up),
++  which is what the task asks for.
++- Review playback serves part 1 only (out of scope). A rotated
++  session's Review page plays the first ~cap of audio; a follow-up can
++  expose `partPaths` through a route or frontmatter list.
++- `bytesWritten` reverts to a cross-part total; the existing tests that
++  read it before `finalize` use single-part recordings and are
++  unaffected.
++- Rotation does not fix the pre-existing "unfinalized WAV reports
++  `dataSize: 0` after a crash" limitation (PLAN-010 Risks); a crashed
++  session can now leave several valid parts plus one unfinalized tail.
++- Pre-existing test flake (carried over from PLAN-012): `REST + WS
++  surface > full session lifecycle` asserts exact millisecond cue times
++  that can drift by 1 ms; unrelated to this plan - re-run before
++  treating the gate as failed.
++
++## Definition of Done
++
++- [ ] `WAV_MAX_FILE_MB` is parsed by `envSchema` with default 500 and is
++  documented in `.env.example`.
++- [ ] `WavRecorder` accepts `maxBytes`, rotates into
++  `<stem>.part-NNN.wav` parts (part 1 unchanged at `<stem>.wav`), and
++  every produced file is a valid standalone WAV `<= maxBytes`.
++- [ ] Reaching the cap finalizes the current part and continues
++  recording; the session is never stopped by rotation.
++- [ ] `SessionManager` resolves the cap from `WAV_MAX_FILE_MB`,
++  overridable via `SessionManagerDeps.wavMaxBytes` for tests.
++- [ ] `partPaths` / `partCount` expose rotated parts; `abort()` removes
++  all of them; `meta.audio_file` and the `/audio` route keep pointing
++  at part 1.
++- [ ] New unit, config, and end-to-end tests pass with byte-scale caps;
++  `npm test` and `npm run typecheck` are clean.
+-- 
+2.50.0
+
+
+From ad4fc157e6c703bd252e5014268f919eefabbd6c Mon Sep 17 00:00:00 2001
+From: Satoshi Man <mrvuong.bitcoin@gmail.com>
+Date: Thu, 5 Nov 2026 22:08:15 +0700
+Subject: [PATCH 08/17] log: draft PLAN-013 WAV size cap with rotation
+
+---
+ CONTEXTS/04-logs/2026-11-05.md | 31 +++++++++++++++++++++++++++++--
+ 1 file changed, 29 insertions(+), 2 deletions(-)
+
+diff --git a/CONTEXTS/04-logs/2026-11-05.md b/CONTEXTS/04-logs/2026-11-05.md
+index 1377eea..6a23328 100644
+--- a/CONTEXTS/04-logs/2026-11-05.md
++++ b/CONTEXTS/04-logs/2026-11-05.md
+@@ -1,11 +1,11 @@
+ ---
+ date: "2026-11-05"
+-events_count: 91
++events_count: 92
+ ---
+ 
+ # Events on 2026-11-05
+ 
+-Total events: **91**
++Total events: **92**
+ 
+ ## Table of contents
+ 
+@@ -100,6 +100,7 @@ Total events: **91**
+ - [21:57 - Draft PLAN-012 pause/resume WAV recording](#2157---draft-plan-012-pauseresume-wav-recording)
+ - [22:01 - Review pass 1 on PLAN-012 pause/resume WAV recording](#2201---review-pass-1-on-plan-012-pauseresume-wav-recording)
+ - [22:03 - Pause/resume support for session WAV recording](#2203---pauseresume-support-for-session-wav-recording)
++- [22:08 - Draft PLAN-013: WAV size cap with rotation](#2208---draft-plan-013-wav-size-cap-with-rotation)
+ 
+ ---
+ 
+@@ -3216,3 +3217,29 @@ server/session/manager.ts
+ 151 tests pass, tsc clean. Pre-existing flaky ms-level cue assertion in 'full session lifecycle' is unrelated (PLAN-012 Risks). Follow-up: unfinalized WAV headers still report dataSize 0 (PLAN-010 Risks).
+ 
+ ---
++## 22:08 - Draft PLAN-013: WAV size cap with rotation
++
++**Scope:** CONTEXTS/03-implement-plan | **Type:** Docs
++
++## Scope
++CONTEXTS/03-implement-plan
++
++## Type
++Docs
++
++## User request
++Draft an implementation plan for a configurable WAV recording size cap with rotation (default 500 MB); do not implement
++
++## Reason
++Long sessions produce unbounded WAV files; plan pins cap semantics, part naming, injection seam, and test coverage before implementation
++
++## Description
++Drafted PLAN-013 covering a configurable WAV size cap (WAV_MAX_FILE_MB, default 500 MB), rotation into <stem>.part-NNN.wav siblings inside WavRecorder, a wavMaxBytes SessionManagerDeps test seam, and unit/config/e2e tests at byte scale. Plan only; no code changes.
++
++## Files changed
++CONTEXTS/03-implement-plan/PLAN-013-wav-size-cap-rotation.md
++
++## Notes
++Part 1 keeps <stem>.wav per ADR-007; multi-part bundle extension flagged as assumption in Risks. Review count 0; needs a verification pass before implementation.
++
++---
+-- 
+2.50.0
+
+
+From cd2331b89c35378ece9a5da7aedf21c8ecc36e10 Mon Sep 17 00:00:00 2001
+From: Satoshi Man <mrvuong.bitcoin@gmail.com>
+Date: Thu, 5 Nov 2026 22:10:44 +0700
+Subject: [PATCH 09/17] Review pass 1 on PLAN-013: pin post-stop assertion
+ order for rotation test
+
+---
+ .../PLAN-013-wav-size-cap-rotation.md         | 22 ++++++++++++-------
+ 1 file changed, 14 insertions(+), 8 deletions(-)
+
+diff --git a/CONTEXTS/03-implement-plan/PLAN-013-wav-size-cap-rotation.md b/CONTEXTS/03-implement-plan/PLAN-013-wav-size-cap-rotation.md
+index 07b0e6d..269eae1 100644
+--- a/CONTEXTS/03-implement-plan/PLAN-013-wav-size-cap-rotation.md
++++ b/CONTEXTS/03-implement-plan/PLAN-013-wav-size-cap-rotation.md
+@@ -2,8 +2,8 @@
+ id: PLAN-013-wav-size-cap-rotation
+ status: draft
+ date: 2026-11-05
+-review_count: 0
+-patch: n/a
++review_count: 1
++patch: applied
+ ---
+ 
+ # PLAN-013: WAV recording size cap with rotation
+@@ -263,12 +263,18 @@ writes more than a few hundred bytes.
+   test can mutate; the test sets `deps.wavMaxBytes` (e.g. 300 -> 256
+   bytes of payload room) after `buildServer`, starts a session with
+   `recordAudio: true`, sends ~600 bytes of PCM in a few chunks, waits
+-  for `provider.audio`, then asserts: `wavPathFor(dir, id)` exists and
+-  is a valid size-patched WAV `<= wavMaxBytes`, the sibling
+-  `.part-002.wav` exists and is a valid size-patched WAV, concatenated
+-  payloads equal the sent bytes, `POST /stop` succeeds (the session is
+-  not torn down by rotation), and `meta.audio_file` still names the
+-  base `.wav` while `GET /api/sessions/:id/audio` still serves part 1.
++  for `provider.audio`, then `POST /stop`s and asserts: the stop
++  succeeds (the session is not torn down by rotation),
++  `wavPathFor(dir, id)` exists and is a valid size-patched WAV
++  `<= wavMaxBytes`, the sibling `.part-002.wav` exists and is a valid
++  size-patched WAV, concatenated payloads equal the sent bytes,
++  `meta.audio_file` still names the base `.wav`, and
++  `GET /api/sessions/:id/audio` still serves part 1. Ordering note:
++  `recorder.append` is fire-and-forget on the write queue, so
++  `provider.audio` reaching N does not prove the queued writes and
++  rotations have landed; `finish()` awaiting `recorder.finalize()`
++  drains the queue, which is why the file assertions run after stop -
++  the same determinism pattern the existing recording tests use.
+ 
+ Existing tests that must keep passing: all of
+ `wav-recorder.test.ts` (no-`maxBytes` path is the old single-file
+-- 
+2.50.0
+
+
+From d278ac154f290d4af7f84b3a1eb511ee52b5ebee Mon Sep 17 00:00:00 2001
+From: Satoshi Man <mrvuong.bitcoin@gmail.com>
+Date: Thu, 5 Nov 2026 22:10:51 +0700
+Subject: [PATCH 10/17] log: review pass 1 on PLAN-013
+
+---
+ CONTEXTS/04-logs/2026-11-05.md | 31 +++++++++++++++++++++++++++++--
+ 1 file changed, 29 insertions(+), 2 deletions(-)
+
+diff --git a/CONTEXTS/04-logs/2026-11-05.md b/CONTEXTS/04-logs/2026-11-05.md
+index 6a23328..6a6d5a1 100644
+--- a/CONTEXTS/04-logs/2026-11-05.md
++++ b/CONTEXTS/04-logs/2026-11-05.md
+@@ -1,11 +1,11 @@
+ ---
+ date: "2026-11-05"
+-events_count: 92
++events_count: 93
+ ---
+ 
+ # Events on 2026-11-05
+ 
+-Total events: **92**
++Total events: **93**
+ 
+ ## Table of contents
+ 
+@@ -101,6 +101,7 @@ Total events: **92**
+ - [22:01 - Review pass 1 on PLAN-012 pause/resume WAV recording](#2201---review-pass-1-on-plan-012-pauseresume-wav-recording)
+ - [22:03 - Pause/resume support for session WAV recording](#2203---pauseresume-support-for-session-wav-recording)
+ - [22:08 - Draft PLAN-013: WAV size cap with rotation](#2208---draft-plan-013-wav-size-cap-with-rotation)
++- [22:10 - Review pass 1 on PLAN-013 WAV size cap rotation](#2210---review-pass-1-on-plan-013-wav-size-cap-rotation)
+ 
+ ---
+ 
+@@ -3243,3 +3244,29 @@ CONTEXTS/03-implement-plan/PLAN-013-wav-size-cap-rotation.md
+ Part 1 keeps <stem>.wav per ADR-007; multi-part bundle extension flagged as assumption in Risks. Review count 0; needs a verification pass before implementation.
+ 
+ ---
++## 22:10 - Review pass 1 on PLAN-013 WAV size cap rotation
++
++**Scope:** CONTEXTS/03-implement-plan | **Type:** Docs
++
++## Scope
++CONTEXTS/03-implement-plan
++
++## Type
++Docs
++
++## User request
++Run ONE verification pass on the newest PLAN in CONTEXTS/03-implement-plan/ per AGENTS.md workflow: re-check against BDRs, ADRs, and the codebase; patch divergences; update review_count and patch frontmatter. Do not implement. Commit only plan changes.
++
++## Reason
++AGENTS.md requires at least one verification pass before implementation; the pass found a test-ordering divergence (queued writes racing immediate assertions) and patched it in place.
++
++## Description
++Ran one verification pass on PLAN-013 against BDRs, ADRs, and the codebase. All governing records verified: BDR-006 additive part-files flagged as ADR candidate rather than silently violated, ADR-005 env-only tunable, ADR-006 no new deps, ADR-001 server-only, ADR-007 wavPathFor/audio_file/audio-route unchanged, PLAN-012 pause gate preserved. All code claims verified (wx flag, 44-byte header, blockAlign 2, serialized queue, paused gate, recorderFailed handling, buildServer deps forwarding). Baseline green: 151 tests, typecheck clean. One divergence found and patched: the app.test.ts rotation test asserted size-patched WAV state right after provider.audio reached N, but recorder.append is fire-and-forget on the write queue; file assertions reordered after POST /stop where finalize drains the queue. Frontmatter updated to review_count: 1, patch: applied. Plan remains draft; not implemented.
++
++## Files changed
++CONTEXTS/03-implement-plan/PLAN-013-wav-size-cap-rotation.md
++
++## Notes
++None
++
++---
+-- 
+2.50.0
+
+
+From 04857c87024b63aa22a41bec68c93e8b2eb00f6d Mon Sep 17 00:00:00 2001
+From: Satoshi Man <mrvuong.bitcoin@gmail.com>
+Date: Thu, 5 Nov 2026 22:13:48 +0700
+Subject: [PATCH 11/17] Implement PLAN-013: WAV recording size cap with
+ rotation
+
+---
+ .env.example                                  |   4 +
+ .../PLAN-013-wav-size-cap-rotation.md         |  14 +--
+ server/app.test.ts                            |  64 +++++++++-
+ server/audio/wav-recorder.test.ts             | 103 +++++++++++++++
+ server/audio/wav-recorder.ts                  | 119 +++++++++++++++---
+ server/config.test.ts                         |  12 ++
+ server/config.ts                              |   1 +
+ server/session/manager.ts                     |   9 +-
+ 8 files changed, 297 insertions(+), 29 deletions(-)
+
+diff --git a/.env.example b/.env.example
+index 34b26a5..26131df 100644
+--- a/.env.example
++++ b/.env.example
+@@ -9,6 +9,10 @@ ASSEMBLYAI_API_KEY=
+ # Seconds of no audio before the STT stream auto-closes (billing hygiene).
+ STT_IDLE_TIMEOUT_S=30
+ 
++# WAV recording rotation: maximum size per .wav file (MiB) before the
++# recorder finalizes it and continues into <stem>.part-NNN.wav siblings.
++WAV_MAX_FILE_MB=500
++
+ # Primary LLM (OpenAI-compatible). Defaults point at DeepSeek.
+ LLM_BASE_URL=https://api.deepseek.com
+ LLM_API_KEY=
+diff --git a/CONTEXTS/03-implement-plan/PLAN-013-wav-size-cap-rotation.md b/CONTEXTS/03-implement-plan/PLAN-013-wav-size-cap-rotation.md
+index 269eae1..e2347c9 100644
+--- a/CONTEXTS/03-implement-plan/PLAN-013-wav-size-cap-rotation.md
++++ b/CONTEXTS/03-implement-plan/PLAN-013-wav-size-cap-rotation.md
+@@ -1,6 +1,6 @@
+ ---
+ id: PLAN-013-wav-size-cap-rotation
+-status: draft
++status: implemented
+ date: 2026-11-05
+ review_count: 1
+ patch: applied
+@@ -321,17 +321,17 @@ Gates: `npm test`, `npm run typecheck`.
+ 
+ ## Definition of Done
+ 
+-- [ ] `WAV_MAX_FILE_MB` is parsed by `envSchema` with default 500 and is
++- [x] `WAV_MAX_FILE_MB` is parsed by `envSchema` with default 500 and is
+   documented in `.env.example`.
+-- [ ] `WavRecorder` accepts `maxBytes`, rotates into
++- [x] `WavRecorder` accepts `maxBytes`, rotates into
+   `<stem>.part-NNN.wav` parts (part 1 unchanged at `<stem>.wav`), and
+   every produced file is a valid standalone WAV `<= maxBytes`.
+-- [ ] Reaching the cap finalizes the current part and continues
++- [x] Reaching the cap finalizes the current part and continues
+   recording; the session is never stopped by rotation.
+-- [ ] `SessionManager` resolves the cap from `WAV_MAX_FILE_MB`,
++- [x] `SessionManager` resolves the cap from `WAV_MAX_FILE_MB`,
+   overridable via `SessionManagerDeps.wavMaxBytes` for tests.
+-- [ ] `partPaths` / `partCount` expose rotated parts; `abort()` removes
++- [x] `partPaths` / `partCount` expose rotated parts; `abort()` removes
+   all of them; `meta.audio_file` and the `/audio` route keep pointing
+   at part 1.
+-- [ ] New unit, config, and end-to-end tests pass with byte-scale caps;
++- [x] New unit, config, and end-to-end tests pass with byte-scale caps;
+   `npm test` and `npm run typecheck` are clean.
+diff --git a/server/app.test.ts b/server/app.test.ts
+index 8b7fadf..e7a9ee8 100644
+--- a/server/app.test.ts
++++ b/server/app.test.ts
+@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+ import { buildServer } from './index.js';
+ import { parseConfig } from './config.js';
+ import { filePathFor, wavPathFor } from './session/markdown.js';
++import type { SessionManagerDeps } from './session/manager.js';
+ import type {
+   Segment,
+   STTProvider,
+@@ -53,6 +54,7 @@ let app: Awaited<ReturnType<typeof buildServer>>;
+ let provider: FakeProvider;
+ let translateSpy: ReturnType<typeof vi.fn>;
+ let assistSpy: ReturnType<typeof vi.fn>;
++let deps: SessionManagerDeps;
+ let port: number;
+ 
+ beforeEach(async () => {
+@@ -65,12 +67,13 @@ beforeEach(async () => {
+   });
+   translateSpy = vi.fn(fakeTranslator.translate);
+   assistSpy = vi.fn(async () => ({ question: null, points: [] }));
+-  app = await buildServer(config, {
++  deps = {
+     rootDir: dir,
+     providerFactory: () => provider,
+     translatorFactory: () => ({ translate: translateSpy }) as Translator,
+     assistantFactory: () => ({ analyze: assistSpy }) as AnswerAssistant,
+-  });
++  };
++  app = await buildServer(config, deps);
+   await app.listen({ port: 0, host: '127.0.0.1' });
+   port = (app.server.address() as AddressInfo).port;
+ });
+@@ -533,6 +536,63 @@ describe('session audio recording', () => {
+     ws.close();
+   });
+ 
++  it('rotates the session WAV when the cap is reached', async () => {
++    deps.wavMaxBytes = 300; // 256 bytes of payload room per part
++    const res = await app.inject({
++      method: 'POST',
++      url: '/api/sessions',
++      payload: { diarize: true, recordAudio: true },
++    });
++    expect(res.statusCode).toBe(201);
++    const info = res.json() as { id: string };
++
++    const { ws, messages } = connectWs();
++    await vi.waitFor(() => expect(messages.length).toBeGreaterThan(0));
++
++    const chunks = [0x41, 0x42, 0x43].map((v) => Buffer.alloc(200, v));
++    for (const c of chunks) ws.send(c);
++    await vi.waitFor(() => expect(provider.audio.length).toBe(3));
++
++    // recorder.append is fire-and-forget on the write queue; stop's
++    // finalize() drains it, so part assertions run after the stop returns
++    const stop = await app.inject({
++      method: 'POST',
++      url: `/api/sessions/${info.id}/stop`,
++    });
++    expect(stop.statusCode).toBe(200);
++
++    // 600 PCM bytes at a 256-byte payload cap -> parts of 256, 256, 88
++    const wav = wavPathFor(dir, info.id);
++    const stem = wav.replace(/\.wav$/, '');
++    const payloads: Buffer[] = [];
++    for (const p of [wav, `${stem}.part-002.wav`, `${stem}.part-003.wav`]) {
++      const buf = await fs.readFile(p);
++      expect(buf.length).toBeLessThanOrEqual(300);
++      expect(buf.subarray(0, 4).toString('ascii')).toBe('RIFF');
++      expect(buf.readUInt32LE(4)).toBe(buf.length - 8);
++      expect(buf.readUInt32LE(40)).toBe(buf.length - 44);
++      payloads.push(buf.subarray(44));
++    }
++    expect(Buffer.concat(payloads)).toEqual(Buffer.concat(chunks));
++
++    // frontmatter + the audio route still point at part 1
++    const read = await app.inject({
++      method: 'GET',
++      url: `/api/sessions/${info.id}`,
++    });
++    const stored = read.json() as { meta: { audio_file: string | null } };
++    expect(stored.meta.audio_file).toBe(path.basename(wav));
++
++    const audio = await app.inject({
++      method: 'GET',
++      url: `/api/sessions/${info.id}/audio`,
++    });
++    expect(audio.statusCode).toBe(200);
++    expect(audio.rawPayload).toEqual(await fs.readFile(wav));
++
++    ws.close();
++  });
++
+   it('pause/resume on a non-recording session leaves no WAV', async () => {
+     const res = await app.inject({
+       method: 'POST',
+diff --git a/server/audio/wav-recorder.test.ts b/server/audio/wav-recorder.test.ts
+index c750620..64736db 100644
+--- a/server/audio/wav-recorder.test.ts
++++ b/server/audio/wav-recorder.test.ts
+@@ -124,4 +124,107 @@ describe('WavRecorder', () => {
+     await rec.append(Buffer.alloc(10, 0x01));
+     expect(rec.bytesWritten).toBe(64);
+   });
++
++  it('rotates into part files that each stay under the cap', async () => {
++    const rec = await WavRecorder.create(wavPath(), { maxBytes: 144 });
++    const payload = Buffer.alloc(250);
++    for (let i = 0; i < payload.length; i++) payload[i] = (i * 7) & 0xff;
++    await rec.append(payload.subarray(0, 80));
++    await rec.append(payload.subarray(80, 180));
++    await rec.append(payload.subarray(180));
++    expect(rec.partCount).toBe(3);
++    await rec.finalize();
++
++    const payloads: Buffer[] = [];
++    for (const p of rec.partPaths) {
++      const buf = await fs.readFile(p);
++      expect(buf.length).toBeLessThanOrEqual(144);
++      expect(buf.subarray(0, 4).toString('ascii')).toBe('RIFF');
++      expect(buf.subarray(8, 12).toString('ascii')).toBe('WAVE');
++      expect(buf.subarray(12, 16).toString('ascii')).toBe('fmt ');
++      expect(buf.subarray(36, 40).toString('ascii')).toBe('data');
++      expect(buf.readUInt32LE(40)).toBe(buf.length - 44);
++      expect(buf.readUInt32LE(4)).toBe(buf.length - 8);
++      payloads.push(buf.subarray(44));
++    }
++    expect(rec.partPaths).toEqual([
++      wavPath(),
++      path.join(dir, 'clip.part-002.wav'),
++      path.join(dir, 'clip.part-003.wav'),
++    ]);
++    expect(Buffer.concat(payloads)).toEqual(payload);
++  });
++
++  it('splits a single oversize chunk at the cap boundary', async () => {
++    const rec = await WavRecorder.create(wavPath(), { maxBytes: 144 });
++    await rec.append(Buffer.alloc(250, 0x77));
++    expect(rec.bytesWritten).toBe(250);
++    await rec.finalize();
++
++    const sizes = await Promise.all(
++      rec.partPaths.map(async (p) => (await fs.readFile(p)).readUInt32LE(40)),
++    );
++    expect(sizes).toEqual([100, 100, 50]);
++  });
++
++  it('keeps parts sample-aligned when the cap is not a multiple of blockAlign', async () => {
++    const rec = await WavRecorder.create(wavPath(), { maxBytes: 145 });
++    await rec.append(Buffer.alloc(250, 0x33));
++    await rec.finalize();
++
++    const first = await fs.readFile(wavPath());
++    expect(first.readUInt32LE(40)).toBe(100); // blockAlign 2: never 101
++    expect(first.length).toBe(144);
++  });
++
++  it('partPaths / partCount reflect rotation order', async () => {
++    const base = wavPath();
++    const rec = await WavRecorder.create(base, { maxBytes: 144 });
++    await rec.append(Buffer.alloc(250, 0x01));
++    expect(rec.partCount).toBe(3);
++    expect(rec.partPaths).toEqual([
++      base,
++      path.join(dir, 'clip.part-002.wav'),
++      path.join(dir, 'clip.part-003.wav'),
++    ]);
++    await rec.finalize();
++
++    const singlePath = path.join(dir, 'single.wav');
++    const single = await WavRecorder.create(singlePath);
++    await single.append(Buffer.alloc(10, 0x01));
++    expect(single.partCount).toBe(1);
++    expect(single.partPaths).toEqual([singlePath]);
++    await single.abort();
++  });
++
++  it('paused appends neither count toward the cap nor trigger rotation', async () => {
++    const rec = await WavRecorder.create(wavPath(), { maxBytes: 144 });
++    rec.pause();
++    await rec.append(Buffer.alloc(500, 0x01));
++    rec.resume();
++    await rec.append(Buffer.alloc(50, 0x02));
++    expect(rec.bytesWritten).toBe(50);
++    expect(rec.partCount).toBe(1);
++    await rec.finalize();
++    await expect(
++      fs.access(path.join(dir, 'clip.part-002.wav')),
++    ).rejects.toThrow();
++  });
++
++  it('abort removes every rotated part', async () => {
++    const rec = await WavRecorder.create(wavPath(), { maxBytes: 144 });
++    await rec.append(Buffer.alloc(250, 0x01));
++    const paths = [...rec.partPaths];
++    expect(paths).toHaveLength(3);
++    await rec.abort();
++    for (const p of paths) {
++      await expect(fs.access(p)).rejects.toThrow();
++    }
++  });
++
++  it('rejects a cap too small to hold one frame', async () => {
++    await expect(
++      WavRecorder.create(wavPath(), { maxBytes: 45 }),
++    ).rejects.toThrow(RangeError);
++  });
+ });
+diff --git a/server/audio/wav-recorder.ts b/server/audio/wav-recorder.ts
+index 2a28b59..4760b72 100644
+--- a/server/audio/wav-recorder.ts
++++ b/server/audio/wav-recorder.ts
+@@ -6,11 +6,18 @@ export interface WavRecorderOptions {
+   sampleRate?: number;
+   channels?: number;
+   bitsPerSample?: number;
++  maxBytes?: number; // max on-disk bytes per part, including the 44-byte header
++}
++
++interface WavFormat {
++  sampleRate: number;
++  channels: number;
++  bitsPerSample: number;
+ }
+ 
+ const HEADER_SIZE = 44;
+ 
+-function wavHeader(opts: Required<WavRecorderOptions>): Buffer {
++function wavHeader(opts: WavFormat): Buffer {
+   const { sampleRate, channels, bitsPerSample } = opts;
+   const blockAlign = (channels * bitsPerSample) / 8;
+   const byteRate = sampleRate * blockAlign;
+@@ -31,6 +38,16 @@ function wavHeader(opts: Required<WavRecorderOptions>): Buffer {
+   return h;
+ }
+ 
++// Rotation naming (PLAN-013): part 1 keeps the ADR-007 <stem>.wav bundle
++// name; when maxBytes is reached the part is finalized and recording
++// continues in <stem>.part-NNN.wav siblings. Opened with 'wx' like part 1,
++// so a name collision fails loudly rather than clobbering.
++function partPathFor(filePath: string, part: number): string {
++  if (part === 1) return filePath;
++  const stem = filePath.replace(/\.wav$/i, '');
++  return `${stem}.part-${String(part).padStart(3, '0')}.wav`;
++}
++
+ // Opt-in session audio capture (PLAN-010): appends the same linear16 PCM
+ // that goes to the STT stream into a canonical WAV so the Review page can
+ // replay it. Writes are serialized like MarkdownSessionWriter's queue so
+@@ -38,28 +55,48 @@ function wavHeader(opts: Required<WavRecorderOptions>): Buffer {
+ export class WavRecorder {
+   private queue: Promise<unknown> = Promise.resolve();
+   private fh: FileHandle | null = null;
+-  private payloadBytes = 0;
++  private payloadBytes = 0; // PCM bytes in the currently open part
++  private totalBytes = 0; // PCM bytes summed across all parts
++  private readonly parts: string[] = [];
++  private readonly blockAlign: number;
++  private readonly payloadCap: number;
+   private done = false;
+   private paused = false;
+ 
+   private constructor(
+     private readonly filePath: string,
+-    private readonly opts: Required<WavRecorderOptions>,
+-  ) {}
++    private readonly fmt: WavFormat,
++    maxBytes: number | undefined,
++  ) {
++    this.blockAlign = (fmt.channels * fmt.bitsPerSample) / 8;
++    this.payloadCap =
++      maxBytes === undefined ? Infinity : maxBytes - HEADER_SIZE;
++  }
+ 
+   static async create(
+     filePath: string,
+     opts: WavRecorderOptions = {},
+   ): Promise<WavRecorder> {
+-    const full: Required<WavRecorderOptions> = {
++    const fmt: WavFormat = {
+       sampleRate: opts.sampleRate ?? 16_000,
+       channels: opts.channels ?? 1,
+       bitsPerSample: opts.bitsPerSample ?? 16,
+     };
+-    const rec = new WavRecorder(filePath, full);
++    const rec = new WavRecorder(filePath, fmt, opts.maxBytes);
++    // A cap that cannot hold one sample frame is a config bug: fail the
++    // session start rather than record nothing.
++    if (
++      opts.maxBytes !== undefined &&
++      opts.maxBytes < HEADER_SIZE + rec.blockAlign
++    ) {
++      throw new RangeError(
++        `maxBytes ${opts.maxBytes} cannot hold the header plus one sample frame`,
++      );
++    }
+     await fs.mkdir(path.dirname(filePath), { recursive: true });
+     rec.fh = await fs.open(filePath, 'wx');
+-    await rec.fh.write(wavHeader(full));
++    await rec.fh.write(wavHeader(fmt));
++    rec.parts.push(filePath);
+     return rec;
+   }
+ 
+@@ -67,13 +104,38 @@ export class WavRecorder {
+     if (this.paused) return Promise.resolve();
+     return this.enqueue(async () => {
+       if (!this.fh || this.done) return;
+-      await this.fh.write(chunk);
+-      this.payloadBytes += chunk.length;
++      let view = chunk;
++      while (view.length > 0) {
++        const room = this.payloadCap - this.payloadBytes;
++        if (room < this.blockAlign) {
++          await this.rotate();
++          continue;
++        }
++        const fh = this.fh;
++        if (!fh) return;
++        // split at sample boundaries, never mid-sample and never over the cap
++        const n = Math.min(
++          view.length,
++          Math.floor(room / this.blockAlign) * this.blockAlign,
++        );
++        await fh.write(view.subarray(0, n));
++        this.payloadBytes += n;
++        this.totalBytes += n;
++        view = view.subarray(n);
++      }
+     });
+   }
+ 
+   get bytesWritten(): number {
+-    return this.payloadBytes;
++    return this.totalBytes;
++  }
++
++  get partPaths(): readonly string[] {
++    return this.parts;
++  }
++
++  get partCount(): number {
++    return this.parts.length;
+   }
+ 
+   pause(): void {
+@@ -92,13 +154,7 @@ export class WavRecorder {
+     await this.enqueue(async () => {
+       if (!this.fh || this.done) return;
+       this.done = true;
+-      const sizes = Buffer.alloc(4);
+-      sizes.writeUInt32LE(36 + this.payloadBytes, 0);
+-      await this.fh.write(sizes, 0, 4, 4);
+-      sizes.writeUInt32LE(this.payloadBytes, 0);
+-      await this.fh.write(sizes, 0, 4, 40);
+-      await this.fh.close();
+-      this.fh = null;
++      await this.closePart();
+     });
+   }
+ 
+@@ -108,10 +164,37 @@ export class WavRecorder {
+       const fh = this.fh;
+       this.fh = null;
+       if (fh) await fh.close();
+-      await fs.unlink(this.filePath).catch(() => {});
++      for (const p of this.parts) {
++        await fs.unlink(p).catch(() => {});
++      }
+     });
+   }
+ 
++  // Finalize the open part (sizes patched, handle closed) then open the
++  // next numbered part. Runs inside the enqueued write op so a rotate can
++  // never interleave with another append or with finalize/abort; at most
++  // one part is ever open and every completed part is a standalone WAV.
++  private async rotate(): Promise<void> {
++    await this.closePart();
++    const next = partPathFor(this.filePath, this.parts.length + 1);
++    this.fh = await fs.open(next, 'wx');
++    await this.fh.write(wavHeader(this.fmt));
++    this.parts.push(next);
++    this.payloadBytes = 0;
++  }
++
++  private async closePart(): Promise<void> {
++    const fh = this.fh;
++    if (!fh) return;
++    const sizes = Buffer.alloc(4);
++    sizes.writeUInt32LE(36 + this.payloadBytes, 0);
++    await fh.write(sizes, 0, 4, 4);
++    sizes.writeUInt32LE(this.payloadBytes, 0);
++    await fh.write(sizes, 0, 4, 40);
++    await fh.close();
++    this.fh = null;
++  }
++
+   private enqueue<T>(op: () => Promise<T>): Promise<T> {
+     const run = this.queue.then(op);
+     this.queue = run.catch(() => {});
+diff --git a/server/config.test.ts b/server/config.test.ts
+index aa3da43..e9fc901 100644
+--- a/server/config.test.ts
++++ b/server/config.test.ts
+@@ -20,6 +20,18 @@ describe('parseConfig', () => {
+     expect(c.PORT).toBe(3000);
+   });
+ 
++  it('parses WAV_MAX_FILE_MB (default 500) and rejects bad values', () => {
++    expect(parseConfig(validEnv).WAV_MAX_FILE_MB).toBe(500);
++    expect(
++      parseConfig({ ...validEnv, WAV_MAX_FILE_MB: '250' }).WAV_MAX_FILE_MB,
++    ).toBe(250);
++    for (const bad of ['0', '-5', 'abc']) {
++      expect(() =>
++        parseConfig({ ...validEnv, WAV_MAX_FILE_MB: bad }),
++      ).toThrow(/WAV_MAX_FILE_MB/);
++    }
++  });
++
+   it('fails fast with a readable error when the selected provider key is missing', () => {
+     expect(() =>
+       parseConfig({ ...validEnv, DEEPGRAM_API_KEY: undefined }),
+diff --git a/server/config.ts b/server/config.ts
+index 5857217..debdf24 100644
+--- a/server/config.ts
++++ b/server/config.ts
+@@ -11,6 +11,7 @@ const envSchema = z.object({
+   DEEPGRAM_API_KEY: optionalKey,
+   ASSEMBLYAI_API_KEY: optionalKey,
+   STT_IDLE_TIMEOUT_S: z.coerce.number().int().positive().default(30),
++  WAV_MAX_FILE_MB: z.coerce.number().int().positive().default(500),
+   LLM_BASE_URL: z.url().default('https://api.deepseek.com'),
+   LLM_API_KEY: optionalKey,
+   TRANSLATE_MODEL: z.string().min(1).default('deepseek-flash'),
+diff --git a/server/session/manager.ts b/server/session/manager.ts
+index b22ea05..825f034 100644
+--- a/server/session/manager.ts
++++ b/server/session/manager.ts
+@@ -102,6 +102,7 @@ export interface SessionManagerDeps {
+   providerFactory?: (config: Config, diarize: boolean) => STTProvider;
+   translatorFactory?: (config: Config) => Translator;
+   assistantFactory?: (config: Config) => AnswerAssistant;
++  wavMaxBytes?: number;
+ }
+ 
+ export class SessionManager {
+@@ -115,7 +116,7 @@ export class SessionManager {
+   constructor(
+     private readonly config: Config,
+     private readonly log: FastifyBaseLogger | Console,
+-    deps: SessionManagerDeps = {},
++    private readonly deps: SessionManagerDeps = {},
+   ) {
+     this.sessionsDir = deps.rootDir ?? path.resolve(process.cwd(), 'sessions');
+     this.providerFactory = deps.providerFactory ?? createSTTProvider;
+@@ -178,7 +179,11 @@ export class SessionManager {
+     let recorder: WavRecorder | null = null;
+     if (opts.recordAudio === true) {
+       const wavPath = wavPathFor(this.sessionsDir, id);
+-      recorder = await WavRecorder.create(wavPath);
++      // Cap resolved lazily from deps so tests can inject a byte-scale cap
++      // after buildServer but before POST /api/sessions (PLAN-013).
++      const maxBytes =
++        this.deps.wavMaxBytes ?? this.config.WAV_MAX_FILE_MB * 1024 * 1024;
++      recorder = await WavRecorder.create(wavPath, { maxBytes });
+       meta.audio_file = path.basename(wavPath);
+     }
+     let writer: SessionWriter;
+-- 
+2.50.0
+
+
+From 8c358f9db806087863ed2e78274db95d78bd50c4 Mon Sep 17 00:00:00 2001
+From: Satoshi Man <mrvuong.bitcoin@gmail.com>
+Date: Thu, 5 Nov 2026 22:13:53 +0700
+Subject: [PATCH 12/17] log: implement PLAN-013 WAV size cap with rotation
+
+---
+ CONTEXTS/04-logs/2026-11-05.md | 45 ++++++++++++++++++++++++++++++++--
+ 1 file changed, 43 insertions(+), 2 deletions(-)
+
+diff --git a/CONTEXTS/04-logs/2026-11-05.md b/CONTEXTS/04-logs/2026-11-05.md
+index 6a6d5a1..395a281 100644
+--- a/CONTEXTS/04-logs/2026-11-05.md
++++ b/CONTEXTS/04-logs/2026-11-05.md
+@@ -1,11 +1,11 @@
+ ---
+ date: "2026-11-05"
+-events_count: 93
++events_count: 94
+ ---
+ 
+ # Events on 2026-11-05
+ 
+-Total events: **93**
++Total events: **94**
+ 
+ ## Table of contents
+ 
+@@ -102,6 +102,7 @@ Total events: **93**
+ - [22:03 - Pause/resume support for session WAV recording](#2203---pauseresume-support-for-session-wav-recording)
+ - [22:08 - Draft PLAN-013: WAV size cap with rotation](#2208---draft-plan-013-wav-size-cap-with-rotation)
+ - [22:10 - Review pass 1 on PLAN-013 WAV size cap rotation](#2210---review-pass-1-on-plan-013-wav-size-cap-rotation)
++- [22:13 - Implement PLAN-013: WAV size cap with rotation](#2213---implement-plan-013-wav-size-cap-with-rotation)
+ 
+ ---
+ 
+@@ -3270,3 +3271,43 @@ CONTEXTS/03-implement-plan/PLAN-013-wav-size-cap-rotation.md
+ None
+ 
+ ---
++## 22:13 - Implement PLAN-013: WAV size cap with rotation
++
++**Scope:** server/audio, server/session, server/config | **Type:** Feature | **Commit:** 04857c8 @ work
++
++## Scope
++server/audio, server/session, server/config
++
++## Type
++Feature
++
++## Commit
++- **Hash:** 04857c8
++- **Repo:** work
++- **Message:** Implement PLAN-013: WAV recording size cap with rotation
++- **Author:** Satoshi Man <mrvuong.bitcoin@gmail.com>
++- **Date:** 2026-11-05 22:13:48 +0700
++
++## User request
++Implement the newest PLAN in CONTEXTS/03-implement-plan/ exactly per its scope and DoD. Commit, tick DoD items, set status: implemented, and log via event.py.
++
++## Reason
++PLAN-013: bound session WAV size for long sessions; rotation keeps part 1 at <stem>.wav so audio_file, wavPathFor, and the /audio route are unchanged; cap tunable via env per ADR-005, no new deps per ADR-006/BDR-002.
++
++## Description
++Added WAV_MAX_FILE_MB (default 500 MiB) to envSchema and .env.example. WavRecorder now accepts maxBytes, splits writes at sample boundaries, and rotates into <stem>.part-NNN.wav siblings; every produced part is a size-patched standalone WAV <= maxBytes. New partPaths/partCount getters; abort() unlinks all parts. SessionManagerDeps gains wavMaxBytes as a test seam, resolved lazily in start(). Covered by new unit, config, and end-to-end tests; npm test (160) and tsc are clean.
++
++## Files changed
++.env.example
++CONTEXTS/03-implement-plan/PLAN-013-wav-size-cap-rotation.md
++server/app.test.ts
++server/audio/wav-recorder.test.ts
++server/audio/wav-recorder.ts
++server/config.test.ts
++server/config.ts
++server/session/manager.ts
++
++## Notes
++None
++
++---
+-- 
+2.50.0
+
+
+From a50ddc0eb0725b5876e9125ad5e6a9fb4ac8da63 Mon Sep 17 00:00:00 2001
+From: Satoshi Man <mrvuong.bitcoin@gmail.com>
+Date: Thu, 5 Nov 2026 22:16:56 +0700
+Subject: [PATCH 13/17] Draft PLAN-014: surface recording status and errors in
+ the UI
+
+---
+ .../PLAN-014-recording-status-ui.md           | 367 ++++++++++++++++++
+ 1 file changed, 367 insertions(+)
+ create mode 100644 CONTEXTS/03-implement-plan/PLAN-014-recording-status-ui.md
+
+diff --git a/CONTEXTS/03-implement-plan/PLAN-014-recording-status-ui.md b/CONTEXTS/03-implement-plan/PLAN-014-recording-status-ui.md
+new file mode 100644
+index 0000000..de47b70
+--- /dev/null
++++ b/CONTEXTS/03-implement-plan/PLAN-014-recording-status-ui.md
+@@ -0,0 +1,367 @@
++---
++id: PLAN-014-recording-status-ui
++status: draft
++date: 2026-11-05
++review_count: 0
++patch: n/a
++---
++
++# PLAN-014: Surface recording status and errors in the UI
++
++## Status
++
++draft
++
++## Context
++
++Session WAV recording (PLAN-010) is best-effort: `WavRecorder.create`
++failure rejects the session start, mid-session `append` failures set
++`recorderFailed` and only `log.warn`, and `finalize` failures in
++`finish()` only `log.error`. On the web side, `Live.tsx` renders a
++static `rec` badge whenever `state.active.record_audio` is true - the
++flag captured at start, not the recorder's real state.
++
++The result: while recording runs the user sees a static badge; when the
++recorder dies mid-session the badge keeps showing `rec` while nothing is
++being written; a create failure does reach the UI as a toast but with a
++raw fs message (`EEXIST: ...`), and a finalize failure is completely
++invisible.
++
++This plan makes the indicator reflect the real recorder state
++(`recording` / `paused` / `failed` / `off`) by adding a derived
++`recording` field to `SessionInfo`, and surfaces every recorder failure
++to the user through the existing `error` WS event -> sonner toast path.
++
++## Governing records
++
++- BDR-006 (supersedes BDR-005): session audio is retained by default as
++  a sibling WAV. Because retention is the default, its state is
++  first-class UI information - a silent failure violates the expectation
++  the default creates.
++- BDR-002 / ADR-006: no new dependencies. The indicator reuses `Badge`,
++  `LiveDot` (`animate-pulse-soft`), lucide icons, and sonner toasts.
++- ADR-001: server owns recording; state reaches the browser through the
++  `session` WS broadcast and the REST `SessionInfo` payload. The fix is
++  a state field on `SessionInfo`, not a new channel.
++- ADR-002: STT streaming is the paid resource; a recorder failure must
++  not interrupt transcription. Recording stays best-effort - only its
++  visibility changes.
++- PLAN-003 (UI design language): status semantics are pinned as
++  "live/recording = `--primary` pulsing dot" and destructive is the
++  error color. The indicator follows those exact rules.
++- PLAN-010: recording semantics are unchanged - create failure fails the
++  start (the user asked for recording, so failing is more honest than
++  silently running unrecorded), mid-session failure continues the
++  session unrecorded with at most one notification. This plan changes
++  only where the failure is *seen*, not whether the session survives.
++- PLAN-012: pause/resume semantics preserved - paused audio never
++  reaches the write queue, so 'paused' is a recording state too, not
++  just a session state.
++
++## Scope
++
++In scope:
++
++1. `server/session/manager.ts`: `RecordingState` type + `recording`
++   field on `SessionInfo`, a `RecordingUnavailableError`, a
++   `recorderFactory` test seam on `SessionManagerDeps`, an
++   `error`-event + `session` rebroadcast on mid-session append failure,
++   and an `error` event on finalize failure.
++2. `web/src/lib/types.ts`: mirror `RecordingState` and the new field.
++3. `web/src/pages/Live.tsx`: replace the static `rec` badge with a
++   state-driven indicator (`rec` pulsing / `rec paused` / `rec failed`).
++4. `server/app.test.ts`: new tests under `session audio recording`.
++
++Out of scope:
++
++- Retry/recovery of a failed recorder. `failed` is terminal for the
++  session, matching the existing `recorderFailed` semantics.
++- Surfacing recording state on the Review page or Sessions list
++  (post-session artifacts are unchanged).
++- Toaster/error-plumbing changes: `handleEvent`'s `'error'` case already
++  toasts, and `start()`'s catch already toasts REST failures.
++- Changing `record_audio` semantics or removing it (kept for
++  compatibility; see Contracts).
++- Changes to `WavRecorder` itself, `routes.ts`, `ws.ts`,
++  `use-live-session.ts`, or the PiP transcript.
++
++## Contracts (literal)
++
++### `server/session/manager.ts`
++
++```ts
++export type RecordingState = 'off' | 'recording' | 'paused' | 'failed';
++```
++
++`SessionInfo` gains one field:
++
++```ts
++export interface SessionInfo {
++  // ...existing fields unchanged...
++  paused: boolean;
++  assist: boolean;
++  record_audio: boolean;
++  recording: RecordingState;
++}
++```
++
++`record_audio` keeps its current meaning ("recording was enabled for
++this session") so existing tests and payloads are undisturbed;
++`recording` is the state the UI renders.
++
++```ts
++export class RecordingUnavailableError extends Error {
++  readonly code = 'RECORDING_UNAVAILABLE';
++}
++```
++
++- Constructed in `start()` around `WavRecorder.create`; message shape
++  (pinned): `` `session audio could not be recorded: ${causeMessage}` ``
++  where `causeMessage` is `cause instanceof Error ? cause.message :
++  String(cause)`.
++- It is not mapped in `setErrorHandler`, so it returns the generic 500
++  `{ error, code }` body. The client's `start()` catch already toasts
++  `body.error`, which is the required clear notification.
++
++```ts
++// SessionManagerDeps gains a test seam, same pattern as providerFactory:
++recorderFactory?: (filePath: string, opts: WavRecorderOptions) => Promise<WavRecorder>;
++```
++
++- Resolved in the constructor as
++  `deps.recorderFactory ?? ((p, o) => WavRecorder.create(p, o))` and
++  called in `start()` where `WavRecorder.create` is called today.
++
++State machine (the field lives on `active.info` and is mutated wherever
++`info.paused` is already mutated, so every `session` broadcast and every
++`GET /api/sessions` response carries the live value - including the
++initial `session` event a reconnecting socket receives):
++
++| Transition | Rule |
++|---|---|
++| `start()` | `recording = recorder != null ? 'recording' : 'off'` |
++| `pause()` | `if (info.recording === 'recording') info.recording = 'paused'` |
++| `resume()` | `if (info.recording === 'paused') info.recording = 'recording'` |
++| append failure | `info.recording = 'failed'` (see below) |
++| `finish()` | no change - the session ends; idle carries no info |
++
++`failed` is sticky: a failed recorder that later pauses reports
++`failed`, not `paused`, because 'paused' would claim recording resumes
++on resume.
++
++Mid-session append failure (`sendAudio`'s `.catch`, inside the existing
++`recorderFailed` guard so it fires at most once), pinned order and text:
++
++```ts
++active.recorderFailed = true;
++active.info.recording = 'failed';
++this.broadcast({
++  type: 'error',
++  code: 'RECORDING_FAILED',
++  message: 'session audio recording failed; continuing without saving audio',
++});
++this.broadcast({ type: 'session', state: 'active', session: active.info });
++```
++
++Finalize failure (`finish()`'s `recorder.finalize()` catch), broadcast
++before the `session: idle` event so the notification precedes the
++session-ended navigation:
++
++```ts
++this.broadcast({
++  type: 'error',
++  code: 'RECORDING_FAILED',
++  message: 'session audio could not be finalized; the saved recording may be incomplete',
++});
++```
++
++The `error` `ServerEvent` variant already carries `code?: string` on
++both ends; no transport change.
++
++### `web/src/lib/types.ts`
++
++```ts
++export type RecordingState = 'off' | 'recording' | 'paused' | 'failed';
++
++// SessionInfo gains:
++recording: RecordingState;
++```
++
++### `web/src/pages/Live.tsx`
++
++The current block
++
++```tsx
++{state.active.record_audio ? (
++  <Badge variant="secondary">
++    <AudioLines data-icon="inline-start" />
++    rec
++  </Badge>
++) : null}
++```
++
++is replaced by (pinned literals; ordering in the badge row unchanged -
++it stays where `rec` sits today, after `lag` and before `assist`):
++
++```tsx
++{state.active.recording === 'recording' ? (
++  <Badge variant="secondary">
++    <LiveDot />
++    rec
++  </Badge>
++) : null}
++{state.active.recording === 'paused' ? (
++  <Badge variant="outline">
++    <Pause data-icon="inline-start" />
++    rec paused
++  </Badge>
++) : null}
++{state.active.recording === 'failed' ? (
++  <Badge variant="destructive">
++    <AudioLines data-icon="inline-start" />
++    rec failed
++  </Badge>
++) : null}
++```
++
++- `LiveDot` is imported from `@/components/transcript` (the
++  `animate-pulse-soft` primary dot PLAN-003 pins for live/recording).
++- `Pause` is added to the `lucide-react` import.
++- `recording === 'off'` renders nothing, matching today's hidden badge
++  when `record_audio` is false.
++- The existing standalone `paused` badge is untouched - the
++  "paused sessions show paused" requirement is covered both by it and by
++  `rec paused`.
++
++## Steps
++
++### Step 1 - `server/session/manager.ts`
++
++- Add `RecordingState`, the `recording` field on `SessionInfo`, and
++  `RecordingUnavailableError` per the contract.
++- Add `recorderFactory` to `SessionManagerDeps`; resolve it in the
++  constructor next to the other factories.
++- In `start()`: wrap the factory call so a rejection throws
++  `RecordingUnavailableError`; initialize `info.recording`.
++- In `sendAudio()`: extend the existing append `.catch` to set
++  `info.recording = 'failed'` and broadcast the pinned `error` +
++  `session` events.
++- In `pause()` / `resume()`: apply the state-machine transitions next to
++  the existing `info.paused` flips.
++- In `finish()`: broadcast the pinned finalize-failure `error` before
++  the existing `session: idle` broadcast.
++
++### Step 2 - `web/src/lib/types.ts`
++
++- Add `RecordingState` and the `recording` field to `SessionInfo`.
++
++### Step 3 - `web/src/pages/Live.tsx`
++
++- Swap the badge block per the contract; add the `Pause` and `LiveDot`
++  imports.
++
++### Step 4 - tests
++
++- Extend `server/app.test.ts` per the test plan.
++
++## Test plan
++
++Automated (vitest), new cases in the `session audio recording`
++describe of `server/app.test.ts`. Failures are injected through
++`deps.recorderFactory`, which `beforeEach` already exposes via the
++shared `deps` object; a failing stub is cast `as WavRecorder` like the
++existing translator/assistant stubs.
++
++- "reports recording state on the session surface": start with
++  `recordAudio: true` - the POST response carries
++  `recording: 'recording'`; a fresh WS client's first `session` event
++  carries `session.recording === 'recording'`; after `POST /pause` the
++  last active `session` event carries `'paused'`; after `POST /resume`
++  it carries `'recording'` again. A second case starts without
++  `recordAudio` and asserts `recording === 'off'`.
++- "rejects the start when the WAV cannot be created":
++  `deps.recorderFactory = async () => { throw new Error('EEXIST: file exists') }`;
++  `POST /api/sessions` with `recordAudio: true` returns 500,
++  `body.code === 'RECORDING_UNAVAILABLE'`, and `body.error` contains
++  `session audio could not be recorded`; `GET /api/sessions` shows
++  `active === null`.
++- "surfaces a mid-session recording failure once": `deps.recorderFactory`
++  resolves to a stub whose `append` always rejects; start with
++  `recordAudio: true`, connect WS, send two PCM chunks - `vi.waitFor`
++  an `error` event with `code === 'RECORDING_FAILED'` and a `session`
++  active event with `session.recording === 'failed'`; send a third
++  chunk and assert (after a settle wait) exactly one
++  `RECORDING_FAILED` error total, that the provider still received all
++  chunks (session continues unrecorded), and that stop succeeds.
++- "notifies when the recording cannot be finalized": stub with a
++  working `append` and a rejecting `finalize`; start, stop, then assert
++  the `RECORDING_FAILED` `error` event appears in `messages` before the
++  `session: idle` event.
++
++Existing tests that must keep passing: the whole `session audio
++recording`, `pause/resume`, and `REST + WS surface` describes (the new
++field is additive). `web/src/lib/use-live-session.test.ts` needs no
++changes - the reducer stores `SessionInfo` verbatim.
++
++Gates: `npm test`, `npm run typecheck`. Note: root `tsc --noEmit`
++covers `server/` only; the `web/` edit is verified by
++`npm --prefix web run build` (`tsc -b && vite build`) plus a manual
++`npm run dev` smoke check of the badge states.
++
++## Risks and notes
++
++- Assumption (recorded per task instruction): "recording unavailable"
++  keeps the PLAN-010 semantics - the session start fails rather than
++  running unrecorded - and "a clear error notification" is the existing
++  `toast.error(body.error)` path; this plan only makes the message
++  explicit (`session audio could not be recorded: <cause>`) instead of
++  a bare fs error.
++- Assumption: "stopped sessions stop showing it" is satisfied by the
++  existing flow - the `session: idle` broadcast clears `state.active`,
++  unmounting the whole status bar; no persisted 'stopped' state is
++  added.
++- Assumption: `record_audio` stays on `SessionInfo` even though
++  `recording !== 'off'` encodes the same fact; existing tests assert it
++  and the start-form contract is unchanged. A later cleanup could
++  deprecate it.
++- `recording` is additive on `SessionInfo`; an older server would send
++  no field and the client would render no badge (same as
++  `record_audio: false`). Single-binary app ships both ends together.
++- The PiP transcript (`PipTranscript`) has no badge row; the indicator
++  lives in the page status bar only, same as the current `rec` badge.
++- `failed` while paused: pinned as 'failed' (sticky), so resume does not
++  falsely promise recording will come back; transcription itself is
++  unaffected either way.
++- The finalize-failure toast may race `onSessionEnded` navigation to
++  Review; sonner toasts persist across client-side navigation and the
++  error event is pinned before `idle`, so it is still seen.
++- Pre-existing flake carried over from earlier plans: `REST + WS
++  surface > full session lifecycle` asserts exact millisecond cue times
++  that can drift by 1 ms; re-run before treating the gate as failed.
++
++## Definition of Done
++
++- [ ] `SessionInfo` carries `recording: 'off' | 'recording' | 'paused' |
++      'failed'` end-to-end (server type, WS events, REST payloads, web
++      type), and `record_audio` is unchanged.
++- [ ] `recording` tracks real state: `'recording'` only while the
++      recorder accepts appends, `'paused'` while the session is paused
++      with an intact recorder, `'failed'` after any append failure, and
++      no badge/state when recording is off or the session has ended.
++- [ ] A mid-session append failure produces exactly one
++      `RECORDING_FAILED` `error` event (toast-visible) plus a `session`
++      rebroadcast carrying `recording: 'failed'`; the transcription
++      session continues.
++- [ ] A `finalize` failure produces a `RECORDING_FAILED` `error` event
++      broadcast before `session: idle`.
++- [ ] A `WavRecorder.create` failure rejects `POST /api/sessions` with
++      `code: 'RECORDING_UNAVAILABLE'` and a message starting
++      `session audio could not be recorded:`; no session is left
++      running.
++- [ ] `SessionManagerDeps.recorderFactory` exists and defaults to
++      `WavRecorder.create`.
++- [ ] Live.tsx renders `rec` (pulsing `LiveDot`, secondary), `rec
++      paused` (outline + Pause icon), `rec failed` (destructive), or
++      nothing, keyed on `state.active.recording`.
++- [ ] New `app.test.ts` cases pass; `npm test` and `npm run typecheck`
++      are clean.
+-- 
+2.50.0
+
+
+From fa97578ac6d2c67f4f3ebfa8c3f0cbad5d663bfb Mon Sep 17 00:00:00 2001
+From: Satoshi Man <mrvuong.bitcoin@gmail.com>
+Date: Thu, 5 Nov 2026 22:17:03 +0700
+Subject: [PATCH 14/17] log: draft PLAN-014 recording status and errors in the
+ UI
+
+---
+ CONTEXTS/04-logs/2026-11-05.md | 38 ++++++++++++++++++++++++++++++++--
+ 1 file changed, 36 insertions(+), 2 deletions(-)
+
+diff --git a/CONTEXTS/04-logs/2026-11-05.md b/CONTEXTS/04-logs/2026-11-05.md
+index 395a281..e74265c 100644
+--- a/CONTEXTS/04-logs/2026-11-05.md
++++ b/CONTEXTS/04-logs/2026-11-05.md
+@@ -1,11 +1,11 @@
+ ---
+ date: "2026-11-05"
+-events_count: 94
++events_count: 95
+ ---
+ 
+ # Events on 2026-11-05
+ 
+-Total events: **94**
++Total events: **95**
+ 
+ ## Table of contents
+ 
+@@ -103,6 +103,7 @@ Total events: **94**
+ - [22:08 - Draft PLAN-013: WAV size cap with rotation](#2208---draft-plan-013-wav-size-cap-with-rotation)
+ - [22:10 - Review pass 1 on PLAN-013 WAV size cap rotation](#2210---review-pass-1-on-plan-013-wav-size-cap-rotation)
+ - [22:13 - Implement PLAN-013: WAV size cap with rotation](#2213---implement-plan-013-wav-size-cap-with-rotation)
++- [22:17 - Draft PLAN-014 recording status and errors in the UI](#2217---draft-plan-014-recording-status-and-errors-in-the-ui)
+ 
+ ---
+ 
+@@ -3311,3 +3312,36 @@ server/session/manager.ts
+ None
+ 
+ ---
++## 22:17 - Draft PLAN-014 recording status and errors in the UI
++
++**Scope:** CONTEXTS/03-implement-plan | **Type:** Docs | **Commit:** a50ddc0 @ work
++
++## Scope
++CONTEXTS/03-implement-plan
++
++## Type
++Docs
++
++## Commit
++- **Hash:** a50ddc0
++- **Repo:** work
++- **Message:** Draft PLAN-014: surface recording status and errors in the UI
++- **Author:** Satoshi Man <mrvuong.bitcoin@gmail.com>
++- **Date:** 2026-11-05 22:16:56 +0700
++
++## User request
++Surface recording status and errors in the UI; draft an implementation plan only, no code changes
++
++## Reason
++The UI showed a static rec badge from the start-time record_audio flag while mid-session recorder failures were only log.warn'd; plan pins the SessionInfo contract, error event text, badge states, and a recorderFactory test seam
++
++## Description
++Drafted PLAN-014: add a derived recording field (off/recording/paused/failed) to SessionInfo, surface recorder failures via RECORDING_FAILED/RECORDING_UNAVAILABLE error events, and replace the static rec badge with a state-driven indicator in Live.tsx. Draft only; review_count 0, patch n/a.
++
++## Files changed
++CONTEXTS/03-implement-plan/PLAN-014-recording-status-ui.md
++
++## Notes
++No new BDRs/ADRs; assumptions recorded in the plan's Risks section
++
++---
+-- 
+2.50.0
+
+
+From 5880a6b0f810eecebc41b531baec1b76bfe27b21 Mon Sep 17 00:00:00 2001
+From: Satoshi Man <mrvuong.bitcoin@gmail.com>
+Date: Thu, 5 Nov 2026 22:21:37 +0700
+Subject: [PATCH 15/17] Review pass 1 on PLAN-014: lazy recorderFactory seam,
+ once-guard, web fixture
+
+---
+ .../PLAN-014-recording-status-ui.md           | 46 +++++++++++++------
+ 1 file changed, 31 insertions(+), 15 deletions(-)
+
+diff --git a/CONTEXTS/03-implement-plan/PLAN-014-recording-status-ui.md b/CONTEXTS/03-implement-plan/PLAN-014-recording-status-ui.md
+index de47b70..9cbfe60 100644
+--- a/CONTEXTS/03-implement-plan/PLAN-014-recording-status-ui.md
++++ b/CONTEXTS/03-implement-plan/PLAN-014-recording-status-ui.md
+@@ -2,8 +2,8 @@
+ id: PLAN-014-recording-status-ui
+ status: draft
+ date: 2026-11-05
+-review_count: 0
+-patch: n/a
++review_count: 1
++patch: applied
+ ---
+ 
+ # PLAN-014: Surface recording status and errors in the UI
+@@ -71,6 +71,9 @@ In scope:
+ 3. `web/src/pages/Live.tsx`: replace the static `rec` badge with a
+    state-driven indicator (`rec` pulsing / `rec paused` / `rec failed`).
+ 4. `server/app.test.ts`: new tests under `session audio recording`.
++5. `web/src/lib/use-live-session.test.ts`: the `info()` `SessionInfo`
++   fixture gains `recording` (the new field is required, so `tsc -b`
++   rejects the literal without it; no behavior change).
+ 
+ Out of scope:
+ 
+@@ -128,9 +131,13 @@ export class RecordingUnavailableError extends Error {
+ recorderFactory?: (filePath: string, opts: WavRecorderOptions) => Promise<WavRecorder>;
+ ```
+ 
+-- Resolved in the constructor as
+-  `deps.recorderFactory ?? ((p, o) => WavRecorder.create(p, o))` and
+-  called in `start()` where `WavRecorder.create` is called today.
++- Resolved lazily at the `start()` call site -
++  `this.deps.recorderFactory ?? ((p, o) => WavRecorder.create(p, o))`
++  evaluated inside `start()` where `WavRecorder.create` is called today.
++  Same lazy-deps pattern as `wavMaxBytes` (PLAN-013): tests assign
++  `deps.recorderFactory` in the test body, after `beforeEach` has already
++  run `buildServer` -> `new SessionManager`, so constructor resolution
++  would capture the default before the stub exists.
+ 
+ State machine (the field lives on `active.info` and is mutated wherever
+ `info.paused` is already mutated, so every `session` broadcast and every
+@@ -149,10 +156,14 @@ initial `session` event a reconnecting socket receives):
+ `failed`, not `paused`, because 'paused' would claim recording resumes
+ on resume.
+ 
+-Mid-session append failure (`sendAudio`'s `.catch`, inside the existing
+-`recorderFailed` guard so it fires at most once), pinned order and text:
++Mid-session append failure (`sendAudio`'s `.catch`): the existing
++`recorderFailed` check gates the `append` call, and a re-check inside the
++`.catch` keeps the notification to once - two chunks sent before the
++first rejection settles both enqueue `append`s and both can reject.
++Pinned order and text:
+ 
+ ```ts
++if (active.recorderFailed) return;
+ active.recorderFailed = true;
+ active.info.recording = 'failed';
+ this.broadcast({
+@@ -239,8 +250,9 @@ it stays where `rec` sits today, after `lag` and before `assist`):
+ 
+ - Add `RecordingState`, the `recording` field on `SessionInfo`, and
+   `RecordingUnavailableError` per the contract.
+-- Add `recorderFactory` to `SessionManagerDeps`; resolve it in the
+-  constructor next to the other factories.
++- Add `recorderFactory` to `SessionManagerDeps`; resolve it lazily at
++  the `start()` call site (same pattern as `wavMaxBytes`) so test
++  injection after `buildServer` works.
+ - In `start()`: wrap the factory call so a rejection throws
+   `RecordingUnavailableError`; initialize `info.recording`.
+ - In `sendAudio()`: extend the existing append `.catch` to set
+@@ -263,14 +275,17 @@ it stays where `rec` sits today, after `lag` and before `assist`):
+ ### Step 4 - tests
+ 
+ - Extend `server/app.test.ts` per the test plan.
++- Add `recording: 'off'` to the `info()` `SessionInfo` fixture in
++  `web/src/lib/use-live-session.test.ts`.
+ 
+ ## Test plan
+ 
+ Automated (vitest), new cases in the `session audio recording`
+ describe of `server/app.test.ts`. Failures are injected through
+ `deps.recorderFactory`, which `beforeEach` already exposes via the
+-shared `deps` object; a failing stub is cast `as WavRecorder` like the
+-existing translator/assistant stubs.
++shared `deps` object; a failing stub is cast `as unknown as WavRecorder`
++(`WavRecorder` is a class with private fields, so a direct `as` cast is
++rejected by tsc) like the existing translator/assistant stubs.
+ 
+ - "reports recording state on the session surface": start with
+   `recordAudio: true` - the POST response carries
+@@ -300,8 +315,9 @@ existing translator/assistant stubs.
+ 
+ Existing tests that must keep passing: the whole `session audio
+ recording`, `pause/resume`, and `REST + WS surface` describes (the new
+-field is additive). `web/src/lib/use-live-session.test.ts` needs no
+-changes - the reducer stores `SessionInfo` verbatim.
++field is additive). `web/src/lib/use-live-session.test.ts` needs one
++fixture edit - the reducer stores `SessionInfo` verbatim so behavior is
++unchanged, but its `info()` literal must gain `recording` for `tsc -b`.
+ 
+ Gates: `npm test`, `npm run typecheck`. Note: root `tsc --noEmit`
+ covers `server/` only; the `web/` edit is verified by
+@@ -363,5 +379,5 @@ covers `server/` only; the `web/` edit is verified by
+ - [ ] Live.tsx renders `rec` (pulsing `LiveDot`, secondary), `rec
+       paused` (outline + Pause icon), `rec failed` (destructive), or
+       nothing, keyed on `state.active.recording`.
+-- [ ] New `app.test.ts` cases pass; `npm test` and `npm run typecheck`
+-      are clean.
++- [ ] New `app.test.ts` cases pass; `npm test`, `npm run typecheck`,
++      and `npm --prefix web run build` are clean.
+-- 
+2.50.0
+
+
+From ef1fb6a49ff5957859451fee5dde42bc6095dc49 Mon Sep 17 00:00:00 2001
+From: Satoshi Man <mrvuong.bitcoin@gmail.com>
+Date: Thu, 5 Nov 2026 22:27:49 +0700
+Subject: [PATCH 16/17] Implement PLAN-014: surface recording status and errors
+ in the UI
+
+---
+ .../PLAN-014-recording-status-ui.md           |  20 +-
+ server/app.test.ts                            | 175 ++++++++++++++++++
+ server/session/manager.ts                     |  66 ++++++-
+ web/src/lib/types.ts                          |   3 +
+ web/src/lib/use-live-session.test.ts          |   1 +
+ web/src/pages/Live.tsx                        |  18 +-
+ 6 files changed, 268 insertions(+), 15 deletions(-)
+
+diff --git a/CONTEXTS/03-implement-plan/PLAN-014-recording-status-ui.md b/CONTEXTS/03-implement-plan/PLAN-014-recording-status-ui.md
+index 9cbfe60..46f8e6f 100644
+--- a/CONTEXTS/03-implement-plan/PLAN-014-recording-status-ui.md
++++ b/CONTEXTS/03-implement-plan/PLAN-014-recording-status-ui.md
+@@ -1,6 +1,6 @@
+ ---
+ id: PLAN-014-recording-status-ui
+-status: draft
++status: implemented
+ date: 2026-11-05
+ review_count: 1
+ patch: applied
+@@ -10,7 +10,7 @@ patch: applied
+ 
+ ## Status
+ 
+-draft
++implemented
+ 
+ ## Context
+ 
+@@ -357,27 +357,27 @@ covers `server/` only; the `web/` edit is verified by
+ 
+ ## Definition of Done
+ 
+-- [ ] `SessionInfo` carries `recording: 'off' | 'recording' | 'paused' |
++- [x] `SessionInfo` carries `recording: 'off' | 'recording' | 'paused' |
+       'failed'` end-to-end (server type, WS events, REST payloads, web
+       type), and `record_audio` is unchanged.
+-- [ ] `recording` tracks real state: `'recording'` only while the
++- [x] `recording` tracks real state: `'recording'` only while the
+       recorder accepts appends, `'paused'` while the session is paused
+       with an intact recorder, `'failed'` after any append failure, and
+       no badge/state when recording is off or the session has ended.
+-- [ ] A mid-session append failure produces exactly one
++- [x] A mid-session append failure produces exactly one
+       `RECORDING_FAILED` `error` event (toast-visible) plus a `session`
+       rebroadcast carrying `recording: 'failed'`; the transcription
+       session continues.
+-- [ ] A `finalize` failure produces a `RECORDING_FAILED` `error` event
++- [x] A `finalize` failure produces a `RECORDING_FAILED` `error` event
+       broadcast before `session: idle`.
+-- [ ] A `WavRecorder.create` failure rejects `POST /api/sessions` with
++- [x] A `WavRecorder.create` failure rejects `POST /api/sessions` with
+       `code: 'RECORDING_UNAVAILABLE'` and a message starting
+       `session audio could not be recorded:`; no session is left
+       running.
+-- [ ] `SessionManagerDeps.recorderFactory` exists and defaults to
++- [x] `SessionManagerDeps.recorderFactory` exists and defaults to
+       `WavRecorder.create`.
+-- [ ] Live.tsx renders `rec` (pulsing `LiveDot`, secondary), `rec
++- [x] Live.tsx renders `rec` (pulsing `LiveDot`, secondary), `rec
+       paused` (outline + Pause icon), `rec failed` (destructive), or
+       nothing, keyed on `state.active.recording`.
+-- [ ] New `app.test.ts` cases pass; `npm test`, `npm run typecheck`,
++- [x] New `app.test.ts` cases pass; `npm test`, `npm run typecheck`,
+       and `npm --prefix web run build` are clean.
+diff --git a/server/app.test.ts b/server/app.test.ts
+index e7a9ee8..164e4a7 100644
+--- a/server/app.test.ts
++++ b/server/app.test.ts
+@@ -8,6 +8,7 @@ import { buildServer } from './index.js';
+ import { parseConfig } from './config.js';
+ import { filePathFor, wavPathFor } from './session/markdown.js';
+ import type { SessionManagerDeps } from './session/manager.js';
++import type { WavRecorder } from './audio/wav-recorder.js';
+ import type {
+   Segment,
+   STTProvider,
+@@ -668,6 +669,180 @@ describe('session audio recording', () => {
+     // without the base offset the stream-relative 0.1s would render 00:00:00
+     expect(stored.srt).toMatch(/\n00:00:0[1-9],\d{3} --> /);
+   });
++
++  it('reports recording state on the session surface', async () => {
++    const res = await app.inject({
++      method: 'POST',
++      url: '/api/sessions',
++      payload: { diarize: true, recordAudio: true },
++    });
++    expect(res.statusCode).toBe(201);
++    const info = res.json() as { id: string; recording: string };
++    expect(info.recording).toBe('recording');
++
++    const { ws, messages } = connectWs();
++    await vi.waitFor(() => expect(messages.length).toBeGreaterThan(0));
++    const lastRecording = () =>
++      (
++        messages
++          .filter((m) => m.type === 'session' && m.state === 'active')
++          .at(-1)?.session as { recording?: string } | undefined
++      )?.recording;
++
++    // a fresh socket's first session event already carries the live state
++    expect(lastRecording()).toBe('recording');
++
++    await app.inject({
++      method: 'POST',
++      url: `/api/sessions/${info.id}/pause`,
++    });
++    await vi.waitFor(() => expect(lastRecording()).toBe('paused'));
++
++    await app.inject({
++      method: 'POST',
++      url: `/api/sessions/${info.id}/resume`,
++    });
++    await vi.waitFor(() => expect(lastRecording()).toBe('recording'));
++
++    await app.inject({ method: 'POST', url: `/api/sessions/${info.id}/stop` });
++    ws.close();
++  });
++
++  it('reports recording off when recordAudio is not requested', async () => {
++    const res = await app.inject({
++      method: 'POST',
++      url: '/api/sessions',
++      payload: { diarize: true },
++    });
++    expect(res.statusCode).toBe(201);
++    const info = res.json() as { id: string; recording: string };
++    expect(info.recording).toBe('off');
++    await app.inject({ method: 'POST', url: `/api/sessions/${info.id}/stop` });
++  });
++
++  it('rejects the start when the WAV cannot be created', async () => {
++    deps.recorderFactory = async () => {
++      throw new Error('EEXIST: file exists');
++    };
++    const res = await app.inject({
++      method: 'POST',
++      url: '/api/sessions',
++      payload: { diarize: true, recordAudio: true },
++    });
++    expect(res.statusCode).toBe(500);
++    const body = res.json() as { error: string; code?: string };
++    expect(body.code).toBe('RECORDING_UNAVAILABLE');
++    expect(body.error).toContain('session audio could not be recorded');
++
++    const list = await app.inject({ method: 'GET', url: '/api/sessions' });
++    expect((list.json() as { active: unknown }).active).toBeNull();
++  });
++
++  it('surfaces a mid-session recording failure once', async () => {
++    deps.recorderFactory = async () =>
++      ({
++        append: async () => {
++          throw new Error('disk full');
++        },
++        pause: () => {},
++        resume: () => {},
++        finalize: async () => {},
++        abort: async () => {},
++      }) as unknown as WavRecorder;
++    const res = await app.inject({
++      method: 'POST',
++      url: '/api/sessions',
++      payload: { diarize: true, recordAudio: true },
++    });
++    expect(res.statusCode).toBe(201);
++    const info = res.json() as { id: string };
++
++    const { ws, messages } = connectWs();
++    await vi.waitFor(() => expect(messages.length).toBeGreaterThan(0));
++
++    ws.send(Buffer.alloc(100, 0x1));
++    ws.send(Buffer.alloc(100, 0x2));
++    await vi.waitFor(() => expect(provider.audio.length).toBe(2));
++    await vi.waitFor(() =>
++      expect(
++        messages.some(
++          (m) => m.type === 'error' && m.code === 'RECORDING_FAILED',
++        ),
++      ).toBe(true),
++    );
++    await vi.waitFor(() =>
++      expect(
++        messages.some(
++          (m) =>
++            m.type === 'session' &&
++            m.state === 'active' &&
++            (m.session as { recording?: string }).recording === 'failed',
++        ),
++      ).toBe(true),
++    );
++
++    // the session continues unrecorded: the provider still gets every chunk
++    ws.send(Buffer.alloc(100, 0x3));
++    await vi.waitFor(() => expect(provider.audio.length).toBe(3));
++    await new Promise((r) => setTimeout(r, 150));
++    expect(
++      messages.filter(
++        (m) => m.type === 'error' && m.code === 'RECORDING_FAILED',
++      ),
++    ).toHaveLength(1);
++
++    const stop = await app.inject({
++      method: 'POST',
++      url: `/api/sessions/${info.id}/stop`,
++    });
++    expect(stop.statusCode).toBe(200);
++    ws.close();
++  });
++
++  it('notifies when the recording cannot be finalized', async () => {
++    deps.recorderFactory = async () =>
++      ({
++        append: async () => {},
++        pause: () => {},
++        resume: () => {},
++        finalize: async () => {
++          throw new Error('disk full');
++        },
++        abort: async () => {},
++      }) as unknown as WavRecorder;
++    const res = await app.inject({
++      method: 'POST',
++      url: '/api/sessions',
++      payload: { diarize: true, recordAudio: true },
++    });
++    expect(res.statusCode).toBe(201);
++    const info = res.json() as { id: string };
++
++    const { ws, messages } = connectWs();
++    await vi.waitFor(() => expect(messages.length).toBeGreaterThan(0));
++
++    const stop = await app.inject({
++      method: 'POST',
++      url: `/api/sessions/${info.id}/stop`,
++    });
++    expect(stop.statusCode).toBe(200);
++    await vi.waitFor(() =>
++      expect(
++        messages.some((m) => m.type === 'session' && m.state === 'idle'),
++      ).toBe(true),
++    );
++    // the error event lands before session: idle so the toast precedes
++    // the session-ended navigation
++    const failIdx = messages.findIndex(
++      (m) => m.type === 'error' && m.code === 'RECORDING_FAILED',
++    );
++    const idleIdx = messages.findIndex(
++      (m) => m.type === 'session' && m.state === 'idle',
++    );
++    expect(failIdx).toBeGreaterThanOrEqual(0);
++    expect(idleIdx).toBeGreaterThan(failIdx);
++    ws.close();
++  });
+ });
+ 
+ describe('pause/resume', () => {
+diff --git a/server/session/manager.ts b/server/session/manager.ts
+index 825f034..7e548aa 100644
+--- a/server/session/manager.ts
++++ b/server/session/manager.ts
+@@ -14,7 +14,10 @@ import { makeTranslator } from '../translate/openai-compat.js';
+ import type { AnswerAssistant, AssistPoint } from '../assist/assistant.js';
+ import { makeAssistant } from '../assist/openai-compat.js';
+ import { IdleTimeoutError } from '../stt/idle-timeout.js';
+-import { WavRecorder } from '../audio/wav-recorder.js';
++import {
++  WavRecorder,
++  type WavRecorderOptions,
++} from '../audio/wav-recorder.js';
+ import {
+   filePathFor,
+   sessionIdFor,
+@@ -39,6 +42,10 @@ export class SessionNotFoundError extends Error {
+   }
+ }
+ 
++export class RecordingUnavailableError extends Error {
++  readonly code = 'RECORDING_UNAVAILABLE';
++}
++
+ export interface SessionStartOptions {
+   targetLang?: string | undefined;
+   diarize?: boolean | undefined;
+@@ -49,6 +56,8 @@ export interface SessionStartOptions {
+   recordAudio?: boolean | undefined;
+ }
+ 
++export type RecordingState = 'off' | 'recording' | 'paused' | 'failed';
++
+ export interface SessionInfo {
+   id: string;
+   started_at: string;
+@@ -60,6 +69,7 @@ export interface SessionInfo {
+   paused: boolean;
+   assist: boolean;
+   record_audio: boolean;
++  recording: RecordingState;
+ }
+ 
+ export type ServerEvent =
+@@ -102,6 +112,10 @@ export interface SessionManagerDeps {
+   providerFactory?: (config: Config, diarize: boolean) => STTProvider;
+   translatorFactory?: (config: Config) => Translator;
+   assistantFactory?: (config: Config) => AnswerAssistant;
++  recorderFactory?: (
++    filePath: string,
++    opts: WavRecorderOptions,
++  ) => Promise<WavRecorder>;
+   wavMaxBytes?: number;
+ }
+ 
+@@ -183,7 +197,19 @@ export class SessionManager {
+       // after buildServer but before POST /api/sessions (PLAN-013).
+       const maxBytes =
+         this.deps.wavMaxBytes ?? this.config.WAV_MAX_FILE_MB * 1024 * 1024;
+-      recorder = await WavRecorder.create(wavPath, { maxBytes });
++      // Same lazy-deps seam as wavMaxBytes (PLAN-014): tests assign
++      // deps.recorderFactory after buildServer constructed this manager.
++      const createRecorder =
++        this.deps.recorderFactory ?? ((p, o) => WavRecorder.create(p, o));
++      try {
++        recorder = await createRecorder(wavPath, { maxBytes });
++      } catch (cause) {
++        const causeMessage =
++          cause instanceof Error ? cause.message : String(cause);
++        throw new RecordingUnavailableError(
++          `session audio could not be recorded: ${causeMessage}`,
++        );
++      }
+       meta.audio_file = path.basename(wavPath);
+     }
+     let writer: SessionWriter;
+@@ -206,6 +232,7 @@ export class SessionManager {
+         paused: false,
+         assist: false,
+         record_audio: recorder != null,
++        recording: recorder != null ? 'recording' : 'off',
+       },
+       writer,
+       recorder,
+@@ -279,8 +306,26 @@ export class SessionManager {
+     const recorder = active.recorder;
+     if (recorder && !active.recorderFailed) {
+       void recorder.append(chunk).catch((err: unknown) => {
++        // Two chunks sent before the first rejection settles both enqueue
++        // appends and both can reject; the re-check keeps this to once.
++        if (active.recorderFailed) return;
+         active.recorderFailed = true;
+-        this.log.warn({ err }, 'audio recording failed; continuing without it');
++        active.info.recording = 'failed';
++        this.log.warn(
++          { err },
++          'audio recording failed; continuing without it',
++        );
++        this.broadcast({
++          type: 'error',
++          code: 'RECORDING_FAILED',
++          message:
++            'session audio recording failed; continuing without saving audio',
++        });
++        this.broadcast({
++          type: 'session',
++          state: 'active',
++          session: active.info,
++        });
+       });
+     }
+   }
+@@ -293,6 +338,11 @@ export class SessionManager {
+     active.paused = true;
+     active.pausedAtMs = Date.now();
+     active.info.paused = true;
++    // 'failed' is sticky: pausing a dead recorder must not claim recording
++    // resumes on resume.
++    if (active.info.recording === 'recording') {
++      active.info.recording = 'paused';
++    }
+     active.recorder?.pause();
+     try {
+       active.stream.close();
+@@ -311,6 +361,9 @@ export class SessionManager {
+     active.pausedTotalMs += Date.now() - active.pausedAtMs;
+     active.paused = false;
+     active.info.paused = false;
++    if (active.info.recording === 'paused') {
++      active.info.recording = 'recording';
++    }
+     active.recorder?.resume();
+     this.broadcast({ type: 'session', state: 'active', session: active.info });
+   }
+@@ -499,6 +552,13 @@ export class SessionManager {
+         await active.recorder.finalize();
+       } catch (err) {
+         this.log.error({ err }, 'failed to finalize session audio');
++        // Ahead of session: idle so the toast precedes the navigation.
++        this.broadcast({
++          type: 'error',
++          code: 'RECORDING_FAILED',
++          message:
++            'session audio could not be finalized; the saved recording may be incomplete',
++        });
+       }
+     }
+     this.broadcast({ type: 'session', state: 'idle' });
+diff --git a/web/src/lib/types.ts b/web/src/lib/types.ts
+index 08e74d9..05b528f 100644
+--- a/web/src/lib/types.ts
++++ b/web/src/lib/types.ts
+@@ -10,6 +10,8 @@ export interface AssistPoint {
+   note: string;
+ }
+ 
++export type RecordingState = 'off' | 'recording' | 'paused' | 'failed';
++
+ export interface SessionInfo {
+   id: string;
+   started_at: string;
+@@ -21,6 +23,7 @@ export interface SessionInfo {
+   paused: boolean;
+   assist: boolean;
+   record_audio: boolean;
++  recording: RecordingState;
+ }
+ 
+ export type ServerEvent =
+diff --git a/web/src/lib/use-live-session.test.ts b/web/src/lib/use-live-session.test.ts
+index 374976b..b691c6e 100644
+--- a/web/src/lib/use-live-session.test.ts
++++ b/web/src/lib/use-live-session.test.ts
+@@ -110,6 +110,7 @@ const info = (paused: boolean): SessionInfo => ({
+   paused,
+   assist: false,
+   record_audio: false,
++  recording: 'off',
+ });
+ 
+ describe('finals', () => {
+diff --git a/web/src/pages/Live.tsx b/web/src/pages/Live.tsx
+index 6a74c19..01f89df 100644
+--- a/web/src/pages/Live.tsx
++++ b/web/src/pages/Live.tsx
+@@ -6,6 +6,7 @@ import {
+   CircleHelp,
+   Mic,
+   Monitor,
++  Pause,
+   Languages,
+   Square,
+   Users,
+@@ -59,6 +60,7 @@ import {
+   type SourceOption,
+ } from '@/components/source-picker';
+ import {
++  LiveDot,
+   LiveStrip,
+   PipTranscript,
+   TranscriptEyeToggle,
+@@ -401,12 +403,24 @@ export function LivePage() {
+         >
+           lag {lag}
+         </Badge>
+-        {state.active.record_audio ? (
++        {state.active.recording === 'recording' ? (
+           <Badge variant="secondary">
+-            <AudioLines data-icon="inline-start" />
++            <LiveDot />
+             rec
+           </Badge>
+         ) : null}
++        {state.active.recording === 'paused' ? (
++          <Badge variant="outline">
++            <Pause data-icon="inline-start" />
++            rec paused
++          </Badge>
++        ) : null}
++        {state.active.recording === 'failed' ? (
++          <Badge variant="destructive">
++            <AudioLines data-icon="inline-start" />
++            rec failed
++          </Badge>
++        ) : null}
+         {state.active.assist ? (
+           <Badge variant="secondary">
+             <CircleHelp data-icon="inline-start" />
+-- 
+2.50.0
+
+
+From 9acd6bf7985d95c91d970a4f8df1642acb9fd1ac Mon Sep 17 00:00:00 2001
+From: Satoshi Man <mrvuong.bitcoin@gmail.com>
+Date: Thu, 5 Nov 2026 22:28:02 +0700
+Subject: [PATCH 17/17] log: implement PLAN-014 recording status and errors in
+ the UI
+
+---
+ CONTEXTS/04-logs/2026-11-05.md | 72 +++++++++++++++++++++++++++++++++-
+ 1 file changed, 70 insertions(+), 2 deletions(-)
+
+diff --git a/CONTEXTS/04-logs/2026-11-05.md b/CONTEXTS/04-logs/2026-11-05.md
+index e74265c..7d46fe3 100644
+--- a/CONTEXTS/04-logs/2026-11-05.md
++++ b/CONTEXTS/04-logs/2026-11-05.md
+@@ -1,11 +1,11 @@
+ ---
+ date: "2026-11-05"
+-events_count: 95
++events_count: 97
+ ---
+ 
+ # Events on 2026-11-05
+ 
+-Total events: **95**
++Total events: **97**
+ 
+ ## Table of contents
+ 
+@@ -104,6 +104,8 @@ Total events: **95**
+ - [22:10 - Review pass 1 on PLAN-013 WAV size cap rotation](#2210---review-pass-1-on-plan-013-wav-size-cap-rotation)
+ - [22:13 - Implement PLAN-013: WAV size cap with rotation](#2213---implement-plan-013-wav-size-cap-with-rotation)
+ - [22:17 - Draft PLAN-014 recording status and errors in the UI](#2217---draft-plan-014-recording-status-and-errors-in-the-ui)
++- [22:21 - Review pass 1 on PLAN-014 recording status UI](#2221---review-pass-1-on-plan-014-recording-status-ui)
++- [22:27 - Implement PLAN-014: recording status surfaced in UI](#2227---implement-plan-014-recording-status-surfaced-in-ui)
+ 
+ ---
+ 
+@@ -3345,3 +3347,69 @@ CONTEXTS/03-implement-plan/PLAN-014-recording-status-ui.md
+ No new BDRs/ADRs; assumptions recorded in the plan's Risks section
+ 
+ ---
++## 22:21 - Review pass 1 on PLAN-014 recording status UI
++
++**Scope:** CONTEXTS/03-implement-plan | **Type:** Docs | **Commit:** 5880a6b @ work
++
++## Scope
++CONTEXTS/03-implement-plan
++
++## Type
++Docs
++
++## Commit
++- **Hash:** 5880a6b
++- **Repo:** work
++- **Message:** Review pass 1 on PLAN-014: lazy recorderFactory seam, once-guard, web fixture
++- **Author:** Satoshi Man <mrvuong.bitcoin@gmail.com>
++- **Date:** 2026-11-05 22:21:37 +0700
++
++## User request
++Run ONE verification pass on the newest PLAN per AGENTS.md: re-check against BDRs, ADRs, codebase; patch divergences; update review_count and patch. Do not implement; commit only plan changes.
++
++## Reason
++AGENTS.md verification loop requires review_count >= 1 before implementation; four pinned contracts diverged from codebase reality (deps resolution timing, once-only broadcast, TS castability, web test fixture) and were patched in place.
++
++## Description
++Ran verification pass 1 on PLAN-014 against BDRs, ADRs, and the codebase. Patched four divergences: recorderFactory now resolves lazily at the start() call site (wavMaxBytes pattern) so post-buildServer test injection works; pinned an in-catch recorderFailed re-check so a mid-session failure notifies at most once; corrected the test stub cast to 'as unknown as WavRecorder'; scoped the use-live-session.test.ts fixture edit and the web build gate. Frontmatter set to review_count: 1, patch: applied.
++
++## Files changed
++CONTEXTS/03-implement-plan/PLAN-014-recording-status-ui.md
++
++## Notes
++Plan remains status: draft; developer moves it to reviewed/approved. No code was touched.
++
++---
++## 22:27 - Implement PLAN-014: recording status surfaced in UI
++
++**Scope:** server/session/manager.ts, web/src/pages/Live.tsx | **Type:** Feature | **Commit:** ef1fb6a @ work
++
++## Scope
++server/session/manager.ts, web/src/pages/Live.tsx
++
++## Type
++Feature
++
++## Commit
++- **Hash:** ef1fb6a
++- **Repo:** work
++- **Message:** Implement PLAN-014: surface recording status and errors in the UI
++- **Author:** Satoshi Man <mrvuong.bitcoin@gmail.com>
++- **Date:** 2026-11-05 22:27:49 +0700
++
++## User request
++Implement the newest PLAN in CONTEXTS/03-implement-plan/ exactly per its scope and DoD. Commit, tick DoD items, set status: implemented, and log via event.py.
++
++## Reason
++PLAN-014 (BDR-006 default audio retention): a silent recorder failure violates the expectation the default creates; the indicator must reflect real recorder state and every recorder failure must reach the user through the existing error -> toast path. Recording stays best-effort per PLAN-010/PLAN-012 semantics.
++
++## Description
++Added a derived recording state ('off' | 'recording' | 'paused' | 'failed') to SessionInfo end-to-end. Live.tsx now renders rec (pulsing LiveDot), rec paused, or rec failed keyed on the real recorder state instead of a static record_audio badge. Recorder failures notify via RECORDING_FAILED error events (toast-visible): once on mid-session append failure with a session rebroadcast, and before session: idle on finalize failure. WavRecorder.create failure now rejects the start with RECORDING_UNAVAILABLE and a clear message. Added a lazy recorderFactory test seam on SessionManagerDeps. Five new app.test.ts cases; web SessionInfo fixture gained recording.
++
++## Files changed
++None
++
++## Notes
++Pre-existing 1ms cue-time flake in 'REST + WS surface > full session lifecycle' observed once; passed on re-run per plan note. Gates: npm test 165 pass, tsc --noEmit clean, web tsc -b + vite build clean.
++
++---
+-- 
+2.50.0
+

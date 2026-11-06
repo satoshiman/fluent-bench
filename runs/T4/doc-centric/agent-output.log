@@ -1,0 +1,68 @@
+I'll follow the repo's AGENTS.md workflow: review the context hierarchy, explore the Sessions page code, then draft (not implement) a plan and commit only that document.Now the key file - the Sessions page - plus supporting modules and the plan that created it.Let me check the remaining governing records and confirm what the session "name" actually is (`SessionSummary` has no `title` field).Plan drafted. Now committing only the plan document, per the repo's commit style.Per AGENTS.md, every task logs an event via `event.py`. Logging now (it will bind to the plan commit).The warning is about pre-existing untracked files (`.start_time`, `agent-output.log`, `node_modules`), not the plan — the event correctly linked to the plan commit `dbd19af`. Committing the log entry per repo convention.Done. Drafted `PLAN-012-sessions-search` and committed only the plan document.
+
+**File:** `CONTEXTS/03-implement-plan/PLAN-012-sessions-search.md`
+
+Frontmatter: `status: draft`, `review_count: 0`, `patch: n/a` — the hard gate applies, so it cannot be implemented until a review pass runs and you move it to `reviewed`/`approved`.
+
+Key decisions pinned in the plan:
+
+- **Pure helper** `filterSessions(sessions, query)` in `web/src/lib/session-filter.ts` — vitest runs `environment: 'node'` with no React test infra, so filterable logic lives in a testable pure function, matching existing lib-test conventions.
+- **Match semantics:** trim + lowercase substring match against `s.id`, raw ISO `started_at`, and `started_at` via `toLocaleString()` (what the user actually sees). Empty query returns the full list.
+- **UI:** existing shadcn `Input` (`type="search"`, `aria-label="Search sessions"`) inside the card above the table; zero matches renders the existing `Empty` family (`SearchX` icon, "No matching sessions") while the input stays visible. No new dependencies, no server changes.
+- **Gates:** `npm test` + `npm run typecheck` (task requirement), plus lint and `web` build per repo convention.
+
+Assumptions recorded in Risks/notes (no clarifications asked, per instructions): `SessionSummary` has no `title` field, so "title/name" = `s.id`; "date" = `started_at` in both ISO and locale-rendered form.
+
+Commits: `dbd19af` (plan document), `30b48d3` (log entry via `event.py`, linked to the plan commit). No code was touched.
+Now let me read the governing records and the codebase files the plan references.Verification pass complete. Every claim in PLAN-012 checks out against the records and codebase:
+
+- **BDR-001/BDR-002**: client-side filter on the already-fetched list, zero new dependencies. `input.tsx` is vendored and `Input` accepts `type="search"` via prop forwarding to Base UI's `InputPrimitive`.
+- **ADR-006**: vitest is `environment: 'node'` with `include: ['web/src/**/*.test.{ts,tsx}']`, so `web/src/lib/session-filter.test.ts` is picked up; `tsc --noEmit`, `oxlint`, `tsc -b && vite build` gates all exist as the plan states.
+- **ADR-007**: `listSessions` (store.ts:69) returns `SessionSummary`; the type has no `title` field, `started_at: string | null` written as `toISOString()` (manager.ts:162), so ISO-substring matching works.
+- **Sessions.tsx**: matches the plan exactly - `useState` already imported, `sessions`/`activeId` state, both early returns, `Empty` family with `variant="icon"` exists, `SearchX` exists in lucide-react 1.68.0, `mt-20 border` is indeed reserved for the page-level empty state, `s.id`/`toLocaleString()` rendered as described.
+
+No divergences found - clean pass. Updating frontmatter to `review_count: 1`, `patch: not-needed`.Committed the plan change. Now logging the verification event per repo workflow (HEAD = the plan commit, so the link is correct).The warning is just the pre-existing untracked files; the event correctly linked to HEAD `57b38c2`. Committing the log entry per convention.Done. One verification pass on `PLAN-012-sessions-search` completed, clean pass, no implementation.
+
+## Result
+
+**Frontmatter updated**: `review_count: 0 → 1`, `patch: n/a → not-needed`. Status stays `draft` per AGENTS.md (only the developer moves it to `reviewed`/`approved`).
+
+## What was verified
+
+| Claim in plan | Verified against | Result |
+|---|---|---|
+| Client-side filtering of the full list | `sessionsApi.list()` returns `{ active, sessions: SessionSummary[] }` | ✓ |
+| `SessionSummary` has no `title`; name = `s.id`, date = `started_at` | `web/src/lib/types.ts` | ✓ |
+| `started_at` is ISO (substring `YYYY-MM-DD` matches), nullable | `manager.ts:162` writes `toISOString()`; `string \| null` in types | ✓ |
+| shadcn `Input` vendored, no new component needed | `web/src/components/ui/input.tsx` exists; props forward to input element | ✓ |
+| `Empty` family + `EmptyMedia variant="icon"` exists | `empty.tsx` | ✓ |
+| `SearchX` icon available | lucide-react 1.68.0 exports it | ✓ |
+| Page structure (early returns, `CardContent`>`Table`, `useState` imported, `mt-20 border` reserved for page-level empty) | `Sessions.tsx` | ✓ |
+| Vitest node env picks up `web/src/lib/*.test.ts`; gates `npm test`/`typecheck`/`lint`/`build` | `vitest.config.ts`, both `package.json` files | ✓ |
+
+## Commits
+
+- `57b38c2` - plan frontmatter change only
+- `aed8de5` - log event per repo workflow (linked to the plan commit)
+
+The plan now clears the hard gate (`review_count >= 1`, `patch` not pending) and is ready for developer review/approval before implementation.
+I'll find the newest plan and check its verification state.Newest is PLAN-012-sessions-search.md. Reading it now.Let me tighten the locale-date test to use the full displayed string.Now the render section: compute `visible`, add the Input, and swap the Table for the Empty block on zero matches.Now close the ternary after `</Table>`.Running the gates now.All 152 tests pass. Now typecheck, lint, and build.The `lint-exit:1` was grep's exit (no matches = my files clean). Verifying lint's real exit code.I'll create temporary session fixtures, run the built app, verify in the browser, then remove the fixtures.API returns both fixture sessions. Now verifying in the browser with playwright-cli.Playwright browser binaries are already cached on this machine; only the CLI wrapper is missing. Installing it globally.Main is empty — likely still loading. Re-snapshotting.Page renders with the searchbox and 2 rows. Testing filter behavior.Filtering works on keystroke. Testing ISO date match and the no-match empty state.Empty state works with input visible. Now testing clear-restore and displayed-date matching.All acceptance criteria verified. Closing browser, stopping the server, removing the gitignored fixtures, and checking commit conventions.Convention found: code commit with `(PLAN-NNN)` suffix, then `plan: mark ... implemented`, then `log: implement ...`. Updating the plan DoD and status first.Both commits done. Logging the event via `event.py`.Event logged (the dirty-tree warning is from pre-existing untracked files unrelated to this task). Committing the log entry.PLAN-012 implemented, verified, and closed out.
+
+**What was built**
+- `web/src/lib/session-filter.ts` — pure `filterSessions(sessions, query)`: trims/lowercases the query, returns the full list on empty, otherwise substring-matches against a haystack of `id` + raw ISO `started_at` + the `toLocaleString()` formatted date (invalid/null dates guarded).
+- `web/src/lib/session-filter.test.ts` — 7 vitest cases covering all listed scenarios.
+- `web/src/pages/Sessions.tsx` — controlled `Input` (`type="search"`, pinned attrs) above the table inside the card, `visible` computed per render, `Empty`/`SearchX` no-match state with the pinned copy, table unchanged over `visible`.
+
+**Verification**
+- `npm test`: 152/152 pass (17 files)
+- `npm run typecheck`: clean
+- `npm --prefix web run lint`: clean (3 pre-existing warnings in untouched files)
+- `npm --prefix web run build`: clean
+- Manual acceptance in a real browser via playwright-cli against the built app with fixture sessions: keystroke filtering, `2026-11-04` ISO match, `4:15` locale-date match, `zzz` no-match empty state with input visible, clear restores full list, case-insensitive `INTERVIEW` match.
+
+**Commits**
+- `926aae0` Search and filter sessions on the Sessions page (PLAN-012)
+- `84b170c` plan: mark PLAN-012 implemented, DoD complete
+- `43255d2` log: implement PLAN-012 sessions search (event bound to `84b170c`)
+
+All four DoD items are ticked and `status: implemented` is set in the plan record.

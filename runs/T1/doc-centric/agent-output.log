@@ -1,0 +1,64 @@
+I'll explore the repo structure, existing CONTEXTS records, and the current SRT export implementation before drafting the plan.Now let me look at the relevant records and find the existing SRT export implementation.No export endpoint exists yet; the ".srt export" refers to the stored `.srt` artifact. Let me check remaining details: path helpers, test patterns for session routes, and a recent plan for format reference.Let me check the server's error handling, index.ts structure, and git state.I have the full picture. Key facts:
+
+- No `/export` endpoint exists; the "existing SRT export" is the stored `.srt` artifact (`readSession` returns it as `stored.srt`), per BDR-006/ADR-007.
+- ADR-007 rejected WebVTT as the *storage* format, so this endpoint is a read-time conversion, not a storage change.
+- Route conventions live in `server/session/routes.ts`; zod parse errors map to 400 via the error handler in `server/index.ts`; tests use `app.inject` in `server/app.test.ts`.
+- Next plan id is `PLAN-012`. I'll draft the plan as `draft` / `review_count: 0` / `patch: n/a`, per AGENTS.md (no implementation until reviewed and approved).
+
+Drafting the plan document now.Now committing only the plan document, then logging the planning event per AGENTS.md.Done. Plan drafted and committed; no code touched.
+
+**What I did:**
+
+- Read the governing records (BDR-006, ADR-007, ADR-006, BDR-002, ADR-001) and the existing code (`routes.ts`, `store.ts`, `srt.ts`, `index.ts`, `app.test.ts`) to pin the design.
+- Drafted `CONTEXTS/03-implement-plan/PLAN-012-vtt-session-export.md` with `status: draft`, `review_count: 0`, `patch: n/a`.
+- Committed only the plan document (`43cff3a`), then logged the planning event via `event.py` (bound to that commit). The log file update is left uncommitted.
+
+**Key decisions recorded in the plan:**
+
+- `GET /api/sessions/:id/export?format=vtt` resolves the session via `readSession` (404 for unknown id, same semantics as `/:id` and `/audio`), then validates `format` through zod (400 via the existing `ZodError` -> 400 handler).
+- A pure `srtToVtt` in `server/session/vtt.ts`: `WEBVTT\n\n` header + line transform converting `,` to `.` only on ` --> ` timing lines; cue numbers pass through as valid WebVTT cue identifiers, text lines pass through byte-for-byte for content parity with the stored `.srt`.
+- Headers: `Content-Type: text/vtt`, `Content-Disposition: attachment; filename="<session-id>.vtt"`.
+
+**Assumptions noted in Risks** (clarifications skipped per instructions): "existing SRT export" = the stored `.srt` artifact (no SRT HTTP endpoint exists today); `format` is required, only `vtt` accepted; session lookup precedes format validation.
+
+Per AGENTS.md's hard gate, the plan needs a verification pass (`review_count >= 1`) and your approval before it can be implemented. Want me to run a review pass now, or will you review it yourself?
+I'll start by exploring the context hierarchy to find the newest plan and the relevant records.The newest plan is `PLAN-012-vtt-session-export.md`. Let me read it and the related records.Now let me verify the plan's claims against the codebase.Now checking `server/app.test.ts` for the fixture patterns the plan references, plus remaining ADRs.Let me check the rest of `app.test.ts`, `tsconfig.json`, `vitest.config.ts`, and `manager.ts` for slug/id conventions, plus grep for any existing `vtt`/`export` code.All core claims verified. Let me check git state and the remaining BDRs for completeness.Verification complete. I checked every claim in PLAN-012 against the BDRs, ADRs, and codebase:
+
+**Verified correct:**
+- `readSession(sessions.dir, id)` returns `StoredSession.srt`, null on invalid id/missing `.md`; `.srt` missing yields `''` -> header-only `WEBVTT` works
+- `setErrorHandler` maps `ZodError` to exactly `400 { error: 'invalid request', issues: [...] }`
+- Route/schema/`req.params as { id: string }`/`.header(...)` style matches `routes.ts`; `sessions.dir` getter exists in `manager.ts`
+- Session id charset `[a-z0-9-]` + day prefix confirmed (`sessionIdFor` + slug regex), so `Content-Disposition` needs no escaping; example filename matches the id regex asserted in `app.test.ts`
+- `cueCount` counts ` --> ` lines in `srt.ts`; hand-rolled helpers precedent holds
+- ADR-007 rejected WebVTT only as *storage*; request-time conversion is consistent. BDR-006 is the live record (BDR-005 superseded). ADR-006/BDR-002 no-new-deps holds; vitest include pattern covers `server/session/vtt.test.ts`; `typecheck`/`test` scripts exist; tsconfig `include` covers `server/**` and has no `noUnusedLocals` so the `_format` destructure is safe
+
+**One divergence found:** the plan says the test fixture "writes session files directly into the tmp `dir`". `readSession` resolves via `filePathFor` to `<dir>/<YYYY-MM-DD>/<stem>.md`, so files at `dir/` root would 404. I'll patch that to pin the day-subdirectory path via the existing helpers, then bump the frontmatter.Now update the frontmatter and add a review note for auditability.Now I'll commit only the plan file.Plan change committed. Per the AGENTS.md workflow, I'll log the review pass as a Docs event bound to this commit.Verification pass complete on `PLAN-012-vtt-session-export`. Commit `9c92640` contains only the plan changes; the event is logged.
+
+## Result
+
+**Verified against records:** BDR-002 (zero added cost/deps), BDR-006 (live record, supersedes BDR-005), ADR-001 (local Fastify REST, no auth), ADR-006 (no new deps, vitest colocation), ADR-007 (rejected WebVTT only as *storage* — request-time conversion is consistent, `.srt` stays canonical).
+
+**Verified against codebase:** `readSession`/`StoredSession.srt` and its null-on-missing semantics, `sessions.dir` getter, `ZodError` → `400 { error: 'invalid request', issues: [...] }` handler, route/schema/`req.params`/`.header(...)` conventions in `routes.ts`, session id charset `[a-z0-9-]` + day prefix (`Content-Disposition` needs no escaping; example filename matches the id regex), `cueCount` ` --> ` line counting, `renderFrontmatter`/`filePathFor`/`srtPathFor`/`FakeProvider`/`app.inject` all exist as described, `typecheck`/`test` gates exist, `verbatimModuleSyntax` and the tsconfig `include` are compatible with the pinned code.
+
+**One divergence patched:** the test fixture said it "writes session files directly into the tmp `dir`", but `readSession` resolves `<dir>/<YYYY-MM-DD>/<stem>.md` — files at `dir/` root would 404. Step 4 and the happy-path test bullet now pin writes to the day subdirectory via the existing `filePathFor`/`srtPathFor` helpers.
+
+**Frontmatter:** `review_count: 1`, `patch: applied`. Plan remains `status: draft` — awaiting developer review/approval before implementation.
+I'll find the newest plan in the plans directory first.The newest plan is `PLAN-012-vtt-session-export` (`review_count: 1`, `patch: applied`) — gate satisfied. Let me read the relevant code files.Now let me check `markdown.ts` helpers, the error handler, and the existing test file.Let me see the rest of the test file and check existing test file conventions.Let me check `srt.test.ts` for test conventions.I have everything I need. Let me check tsconfig for strictness settings that could affect the pinned handler code.All context gathered. `strict` mode doesn't include `noUnusedLocals`, so the pinned `format: _format` destructuring typechecks. Now I'll implement per the plan:
+
+**Step 1: `server/session/vtt.ts`****Step 2: `server/session/routes.ts`** — import, schema, and the pinned route next to `GET /api/sessions/:id`.**Step 3: `server/session/vtt.test.ts`****Step 4: `server/app.test.ts`** — extend the markdown imports and add `describe('session export')`.Now the gates: typecheck and tests.All gates green: typecheck clean, 152 tests passing across 17 files. Let me check how prior plan close-outs were committed to match convention.Convention found: prior plans tick DoD + `status: implemented` inside the same commit as the code, then a separate `log:` commit follows. Let me check the dirty log file state and event.py behavior.The pending log diff is just the previous draft/review events not yet committed. Now I'll tick the DoD items and set `status: implemented` in the plan, matching how PLAN-011 was closed.Now commit code + plan record together (matching the PLAN-011 close-out pattern).Now log the completion event via `event.py` (binds to the new HEAD).Event logged and bound to `c91bd25`. Now commit the log file (it also contains the earlier uncommitted draft/review events).PLAN-012 implemented and closed out. All DoD items satisfied.
+
+**What was done**
+
+- `server/session/vtt.ts` — `srtToVtt`: pure line transform (` --> ` lines get `,` → `.`, everything else passes through byte-for-byte); `WEBVTT\n` for empty input, `WEBVTT\n\n` + body otherwise.
+- `server/session/routes.ts` — `exportQuerySchema` + `GET /api/sessions/:id/export` with the pinned handler: session resolves first (404), then `format` validates via `z.literal('vtt')` (400 via `ZodError`), responds `text/vtt` + `Content-Disposition: attachment; filename="<id>.vtt"`.
+- `server/session/vtt.test.ts` — 4 unit cases (bilingual cues, single-line cue, commas in text untouched, empty input).
+- `server/app.test.ts` — `describe('session export')` with fixture seeding `.md` + `.srt` into the `<dir>/<YYYY-MM-DD>/` day subdirectory, covering happy path, 404, and both 400 cases.
+
+**Verification**: `npm run typecheck` clean, `npm test` green — 17 files, 152 tests. No new dependencies, no storage/writer/web changes.
+
+**Bookkeeping**
+
+- `c91bd25` — code + plan record (`status: implemented`, DoD ticked)
+- `62875cd` — `log:` commit containing the completion event (bound to `c91bd25`) plus the previously uncommitted draft/review events
+
+Untracked files left in the tree (`.start_time`, `agent-output.log`, `node_modules`, `transcript-*.json`) are pre-existing environment artifacts outside the plan scope.

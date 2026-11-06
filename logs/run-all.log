@@ -1,0 +1,38 @@
+Preparing worktree (new branch 'bench/T2-ad-hoc')
+run ready: ~/fluent-bench/runs/T2/ad-hoc
+base commit: 574d415
+>>> T2/ad-hoc (order 1) start 19:43:43
+On branch bench/T2-ad-hoc
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   server/translate/openai-compat.test.ts
+	modified:   server/translate/openai-compat.ts
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	.end_time
+	.start_time
+	agent-output.log
+	server/translate/retry.ts
+	transcript.json
+
+no changes added to commit (use "git add" and/or "git commit -a")
+Traceback (most recent call last):
+  File "<stdin>", line 2, in <module>
+ValueError: not enough values to unpack (expected 8, got 7)
+<<< T2/ad-hoc done wall=180s
+Preparing worktree (new branch 'bench/T2-doc-centric')
+run ready: ~/fluent-bench/runs/T2/doc-centric
+base commit: 81dd398
+>>> T2/doc-centric (order 2) start 19:46:59
+./run-all.sh: line 8: 97306 Terminated: 15          env -u ACP_BACKEND devin -p --respect-workspace-trust false --permission-mode dangerous --export transcript.json -- "$(cat "$BENCH/prompts/$prompt")" > agent-output.log 2>&1
+On branch bench/T2-doc-centric
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	.end_time
+	.start_time
+	agent-output.log
+	node_modules
+
+nothing added to commit but untracked files present (use "git add" to track)

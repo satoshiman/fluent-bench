@@ -1,0 +1,1440 @@
+From 779e429dfc22867e4a64ccc0ae5b23763973a10c Mon Sep 17 00:00:00 2001
+From: Satoshi Man <mrvuong.bitcoin@gmail.com>
+Date: Thu, 5 Nov 2026 21:39:00 +0700
+Subject: [PATCH 1/6] Draft PLAN-012: merge short same-speaker transcript
+ segments in .srt
+
+---
+ .../PLAN-012-merge-short-segments.md          | 295 ++++++++++++++++++
+ 1 file changed, 295 insertions(+)
+ create mode 100644 CONTEXTS/03-implement-plan/PLAN-012-merge-short-segments.md
+
+diff --git a/CONTEXTS/03-implement-plan/PLAN-012-merge-short-segments.md b/CONTEXTS/03-implement-plan/PLAN-012-merge-short-segments.md
+new file mode 100644
+index 0000000..c31a564
+--- /dev/null
++++ b/CONTEXTS/03-implement-plan/PLAN-012-merge-short-segments.md
+@@ -0,0 +1,295 @@
++---
++id: PLAN-012-merge-short-segments
++status: draft
++date: 2026-11-05
++review_count: 0
++patch: n/a
++---
++
++# PLAN-012: Merge consecutive same-speaker segments under a duration threshold in the stored .srt
++
++## Status
++
++draft
++
++## Governing records
++
++- BDR-006: the `.srt` is the canonical transcript artifact and must stay a
++  standard, player-loadable SRT file. Merged output remains plain valid
++  SRT; no format extension is introduced.
++- ADR-007: three-file session bundle (`.md` frontmatter + `## Assist`,
++  `.srt` bilingual cues, `.wav`); cue number = segment index + 1 binds a
++  cue to the socket event index; `.srt` rewrites go through read ->
++  splice -> tmp write -> rename serialized on the writer queue. This
++  plan adds one more rewrite operation of exactly that shape.
++- ADR-005: configuration and tunables come from env vars via `zod` in
++  `server/config.ts`; the merge option is a new env var, not a UI or
++  per-session setting.
++- ADR-006 + BDR-002: no new dependencies; merge is string manipulation
++  inside existing modules.
++
++## Scope
++
++In scope:
++
++1. A new env option `TRANSCRIPT_MERGE_MAX_S` (seconds, default `10`,
++   `0` disables) parsed in `server/config.ts` and documented in
++   `.env.example`.
++2. Merge logic inside `SessionWriter`: consecutive same-speaker segments
++   fold into the previously written cue while the resulting cue span
++   stays under the threshold. Only the `.srt` on disk changes; socket
++   events, segment indices, assist `#n` tags, `active.finals`, and the
++   web display are untouched.
++3. Translation routing so a merged cue collects the translations of all
++   contributing segment indices, joined with a space in index order.
++4. Automated tests for the merge rule, the two new SRT helpers, the
++   config field, and the disabled-equals-unchanged guarantee.
++
++Out of scope: any web/display change (`groupSegments` already groups
++same-speaker finals visually); socket event or index renumbering; `.md`
++body changes (the `.md` holds no transcript lines under ADR-007, so
++"markdown and subtitle export" means the session bundle's two artifacts,
++of which only the subtitle file carries segment text); contiguous cue
++renumbering; retroactive merging of already-stored sessions; merging on
++the read path.
++
++## Contracts (literal)
++
++### Env option (`server/config.ts`, `.env.example`)
++
++```ts
++TRANSCRIPT_MERGE_MAX_S: z.coerce.number().nonnegative().default(10),
++```
++
++`.env.example` block:
++
++```
++# Merge consecutive same-speaker transcript segments into one cue when
++# the merged span stays under this many seconds. 0 disables merging.
++TRANSCRIPT_MERGE_MAX_S=10
++```
++
++`0` means disabled: with `mergeMaxS` unset or `0`, `appendSegment` and
++`appendTranslation` produce byte-identical output to today.
++
++### New helpers in `server/session/srt.ts`
++
++```ts
++// Rewrites cue `index + 1` in place: the end timestamp becomes
++// formatSrtTimestamp(endS) and ` ` + oneLine(text) is appended to the
++// first text line (the source line). A translation line already present
++// is preserved untouched. Returns the updated document, or null when the
++// cue is missing.
++export function extendCue(
++  srt: string,
++  index: number,
++  endS: number,
++  text: string,
++): string | null;
++
++// Sets the translation (last text line) of cue `index + 1`: replaces the
++// existing second text line when present, otherwise appends it. Returns
++// the updated document, or null when the cue is missing.
++export function setCueTranslation(
++  srt: string,
++  index: number,
++  text: string,
++): string | null;
++```
++
++Both reuse the `insertTranslationLine` block-scan pattern
++(`split(/\n{2,}/)`, match first line against `String(index + 1)`, verify
++` --> ` on line 2, rejoin as `` `${blocks.join('\n\n')}\n\n` ``) and the
++`oneLine` newline flattening.
++
++### `SessionWriter` surface (`server/session/writer.ts`)
++
++```ts
++export interface SessionWriterOptions {
++  mergeMaxS?: number; // seconds; > 0 enables merging
++}
++
++static async create(
++  rootDir: string,
++  meta: SessionMeta,
++  log?: WarnLog,
++  opts?: SessionWriterOptions,
++): Promise<SessionWriter>;
++```
++
++Merge rule (the only new decision):
++
++```ts
++seg.speaker === lastCue.speaker && seg.end_s - lastCue.start_s < mergeMaxS
++```
++
++- Speaker equality is on the raw `seg.speaker` label; `undefined ===
++  undefined` counts, so speaker-less runs merge too (same rule the web
++  `groupSegments` uses for display).
++- "Combined duration" is the resulting cue span `lastCue.start_s ->
++  seg.end_s`; "under" is strict `<`, so a span exactly equal to the
++  threshold does not merge.
++- No gap constraint: "consecutive" means adjacent in arrival order only.
++
++Merged cue example (threshold 10; indices 0,1 same speaker):
++
++```
++1
++00:00:00,000 --> 00:00:03,400
++Speaker 1: Hello. there.
++```
++
++Cue numbering keeps the `index + 1` binding for every cue that exists.
++Merged-away indices leave numbering gaps (indices 0,1,2 merged then
++index 3 -> cues `1` and `4`), which is valid SRT and keeps
++`insertTranslationLine`, `backfill`, and `cueCount` semantics exact.
++
++### Translation routing for merged cues
++
++The writer keeps three pieces of bookkeeping, all updated synchronously
++at API-call time (before the op enqueues) so behavior is deterministic:
++
++```ts
++private lastCue?: {
++  cueNo: number;
++  speaker: string | undefined;
++  start_s: number;
++  end_s: number;
++};
++private readonly cueOfIndex = new Map<number, number>(); // index -> cue number
++private readonly mergedCues = new Set<number>();         // cue numbers built by merging
++private readonly cueTranslations = new Map<number, Map<number, string>>(); // cueNo -> index -> text
++```
++
++`appendTranslation(index, text)` resolves `cueNo = cueOfIndex.get(index)
++?? index + 1` (fallback identical to today), then:
++
++- cue not in `mergedCues`: unchanged path - `insertTranslationLine(srt,
++  cueNo - 1, text)`, null -> warn + skip; on success also record
++  `cueTranslations[cueNo][index] = text`.
++- cue in `mergedCues`: record `cueTranslations[cueNo][index] = text`,
++  render `joined = entries sorted by index -> texts joined with ' '`,
++  rewrite the line via `setCueTranslation(srt, cueNo - 1, joined)`,
++  null -> warn + skip.
++
++Recording every translation (not only merged-path ones) is what lets a
++translation that landed before the merge survive the later rewrite in
++correct index order.
++
++## Steps
++
++1. `server/config.ts`: add `TRANSCRIPT_MERGE_MAX_S` to `envSchema`
++   (contract above), placed after `STT_IDLE_TIMEOUT_S`.
++2. `.env.example`: add the documented block above near
++   `STT_IDLE_TIMEOUT_S`.
++3. `server/session/srt.ts`: add `extendCue` and `setCueTranslation` per
++   the literal contracts.
++4. `server/session/writer.ts`:
++   - `SessionWriterOptions`, optional 4th `create` param, stored
++     `mergeMaxS` (default `0`).
++   - New private bookkeeping fields above.
++   - `appendSegment(index, seg)`: when `mergeMaxS > 0` and the merge
++     rule holds against `lastCue`, set `cueOfIndex`, add to
++     `mergedCues`, update `lastCue.end_s`, and enqueue the same
++     read -> `extendCue` -> tmp write -> rename cycle
++     `appendTranslation` uses; null -> warn + skip (defensive; the cue
++     was just written). Otherwise append `formatCue` exactly as today
++     and reset `lastCue`/`cueOfIndex` for the new cue.
++   - `appendTranslation(index, text)`: the two-path routing above;
++     non-merged path code unchanged.
++   - `create`, `appendAssist`, `renameSpeakers`, `finalize`, queue:
++     unchanged.
++5. `server/session/manager.ts`: pass
++   `{ mergeMaxS: this.config.TRANSCRIPT_MERGE_MAX_S }` as the fourth arg
++   to the single `SessionWriter.create` call in `start` (~line 186).
++   Nothing else changes: `handleFinal` still assigns an index,
++   broadcasts, translates, and assists every final.
++6. `server/app.test.ts`: add `TRANSCRIPT_MERGE_MAX_S: '0'` to the
++   `parseConfig` env in `beforeEach` so the existing e2e suite keeps
++   exercising the disabled path (two same-speaker finals exist in the
++   assist suite and would merge under the default `10`). Add one e2e
++   test that builds a second app instance with
++   `TRANSCRIPT_MERGE_MAX_S: '5'`, emits two same-speaker finals, and
++   asserts a single merged cue in `stored.srt`.
++7. Tests per the Test plan section.
++8. Commit, then log via `CONTEXTS/04-logs/event.py`.
++
++## Test plan
++
++- `server/session/srt.test.ts`:
++  - `extendCue`: updates the end timestamp and appends ` ` + text to the
++    source line; preserves an already-present translation line; returns
++    null for a missing cue; flattens embedded newlines.
++  - `setCueTranslation`: appends a second text line when the cue has
++    only a source line; replaces an existing translation line; returns
++    null for a missing cue.
++- `server/session/writer.test.ts` (new `describe` for merging):
++  - merge under threshold: `Speaker 1` segs idx0 `0->2 'Hello.'`, idx1
++    `2->3.4 'there.'` -> single cue `1` with
++    `00:00:00,000 --> 00:00:03,400` and `Speaker 1: Hello. there.`;
++    a third same-speaker seg extends the same cue again (chain merge).
++  - no merge across different speakers: idx1 `Speaker 2` -> separate
++    cue `3` (numbering gap is the documented contract).
++  - no merge over threshold: same speaker, `seg.end_s - lastCue.start_s
++    >= mergeMaxS` -> separate cue.
++  - disabled = unchanged: writer created with no opts (and once with
++    `mergeMaxS: 0`) -> two same-speaker short segs produce exactly the
++    current two-cue output.
++  - translations into a merged cue: `appendTranslation(0, 't0')` +
++    `appendTranslation(1, 't1')` on a merged cue render `t0 t1` on the
++    cue's second line; also the order where t0 lands before the merge
++    and t1 after.
++  - numbering: `cueCount`/file shows gaps but `index + 1` binding holds
++    for cues that exist.
++- `server/config.test.ts`: default `10`; `'0'` parses to `0`; a negative
++  or non-numeric value is rejected.
++- `server/app.test.ts`: `TRANSCRIPT_MERGE_MAX_S: '0'` in the shared
++  env (see step 6) plus one enabled-path e2e asserting the merged cue.
++- Manual: one short live session with merge on; open the `.srt` in a
++  player next to the `.wav` and confirm merged cues play and
++  translations sit on the second line.
++
++## Risks and notes
++
++- Assumption: "markdown and subtitle export" means the session bundle's
++  `.md` + `.srt`; under ADR-007 only the `.srt` carries transcript text,
++  so it is the only file whose content changes. The `.md` (frontmatter +
++  `## Assist`) stays byte-compatible.
++- Assumption: the feature is on by default at `10`s; `0` is the disable
++  switch. If the reviewer prefers opt-in semantics, the field becomes
++  optional with no default - a one-line schema change, noted here so the
++  plan does not need re-drafting.
++- Assumption: "combined duration" = resulting cue span and "under" = `<`.
++  Boundary (`span == threshold`) does not merge.
++- Assumption: speaker-less segments merge with each other
++  (`undefined === undefined`), matching `groupSegments`. If "same
++  speaker" should require a defined label, the rule gains a
++  `seg.speaker !== undefined` clause - also a one-line change.
++- Cue numbering gaps after a merge are deliberate (preserves `index +
++  1` binding); SRT players ignore numbering. Consequence: assist `#n`
++  tags and socket `index` values may reference merged-away indices with
++  no matching cue - cosmetic, consistent with ADR-007's index semantics.
++- Transient state: between a merge rewrite and the absorbed segment's
++  translation landing, the cue shows merged source with the pre-merge
++  translation; the merged-cue translation path then rewrites the line to
++  all pieces joined by ` ` in index order. Out-of-order translation
++  arrivals still render correctly because the render is map-driven, not
++  append-driven.
++- Speaker renames still do not rewrite already-written cue prefixes;
++  merging inherits that existing caveat.
++- `insertTranslationLine` keeps its current contract (null on an
++  already-translated cue) for non-merged cues; only merged cues take the
++  new set/replace path.
++
++## Definition of Done
++
++- [ ] `npm run typecheck` clean; `npm test` green.
++- [ ] Automated tests cover: merge under threshold, no merge across
++      different speakers, no merge over threshold, disabled =
++      byte-identical output.
++- [ ] `TRANSCRIPT_MERGE_MAX_S` parsed with default `10`, `0` disables,
++      documented in `.env.example`.
++- [ ] With merging enabled, a session `.srt` stores merged cues (joined
++      source text, extended end time, joined translation line) while
++      socket events and the `.md` are unchanged.
++- [ ] Plan status updated and completion event logged via `event.py`.
+-- 
+2.50.0
+
+
+From 74249bc9aa3961ffb8611576c28b1492a316dd07 Mon Sep 17 00:00:00 2001
+From: Satoshi Man <mrvuong.bitcoin@gmail.com>
+Date: Thu, 5 Nov 2026 21:39:07 +0700
+Subject: [PATCH 2/6] log: draft PLAN-012 segment merge plan
+
+---
+ CONTEXTS/04-logs/2026-11-05.md | 38 ++++++++++++++++++++++++++++++++--
+ 1 file changed, 36 insertions(+), 2 deletions(-)
+
+diff --git a/CONTEXTS/04-logs/2026-11-05.md b/CONTEXTS/04-logs/2026-11-05.md
+index a251d67..e58cc70 100644
+--- a/CONTEXTS/04-logs/2026-11-05.md
++++ b/CONTEXTS/04-logs/2026-11-05.md
+@@ -1,11 +1,11 @@
+ ---
+ date: "2026-11-05"
+-events_count: 88
++events_count: 89
+ ---
+ 
+ # Events on 2026-11-05
+ 
+-Total events: **88**
++Total events: **89**
+ 
+ ## Table of contents
+ 
+@@ -97,6 +97,7 @@ Total events: **88**
+ - [17:56 - Add README and MIT license](#1756---add-readme-and-mit-license)
+ - [17:58 - Update license copyright to real name](#1758---update-license-copyright-to-real-name)
+ - [18:31 - Standardize workflow name in README](#1831---standardize-workflow-name-in-readme)
++- [21:39 - Draft PLAN-012: merge short same-speaker transcript segments](#2139---draft-plan-012-merge-short-same-speaker-transcript-segments)
+ 
+ ---
+ 
+@@ -3124,3 +3125,36 @@ README.md
+ None
+ 
+ ---
++## 21:39 - Draft PLAN-012: merge short same-speaker transcript segments
++
++**Scope:** CONTEXTS/03-implement-plan | **Type:** Docs | **Commit:** 779e429 @ doc-centric
++
++## Scope
++CONTEXTS/03-implement-plan
++
++## Type
++Docs
++
++## Commit
++- **Hash:** 779e429
++- **Repo:** doc-centric
++- **Message:** Draft PLAN-012: merge short same-speaker transcript segments in .srt
++- **Author:** Satoshi Man <mrvuong.bitcoin@gmail.com>
++- **Date:** 2026-11-05 21:39:00 +0700
++
++## User request
++Add an option to merge consecutive same-speaker transcript segments under a configurable duration threshold; draft only the plan per AGENTS.md
++
++## Reason
++Short same-speaker finals produce noisy stored .srt output. Plan places the merge in the writer layer to preserve the cue=index+1 binding and leave live behavior byte-identical when disabled
++
++## Description
++Drafted implementation plan for merging consecutive same-speaker transcript segments under a configurable duration threshold (TRANSCRIPT_MERGE_MAX_S, default 10s, 0 disables). Merge lives in SessionWriter so only the stored .srt changes; socket events, segment indices, assist tags, and display stay identical. Covers env config, two new srt.ts helpers (extendCue, setCueTranslation), index->cue translation routing, and tests for the four required cases.
++
++## Files changed
++CONTEXTS/03-implement-plan/PLAN-012-merge-short-segments.md
++
++## Notes
++Open assumptions recorded in plan risks: default-on at 10s vs opt-in, strict < threshold, speaker-less segments merge with each other, cue numbering gaps are deliberate
++
++---
+-- 
+2.50.0
+
+
+From dc9dc7503d15dc4aca7ac761ae71e897add6424e Mon Sep 17 00:00:00 2001
+From: Satoshi Man <mrvuong.bitcoin@gmail.com>
+Date: Thu, 5 Nov 2026 21:42:04 +0700
+Subject: [PATCH 3/6] Review PLAN-012: patch divergences from verification pass
+
+---
+ .../PLAN-012-merge-short-segments.md          | 40 ++++++++++++++-----
+ 1 file changed, 30 insertions(+), 10 deletions(-)
+
+diff --git a/CONTEXTS/03-implement-plan/PLAN-012-merge-short-segments.md b/CONTEXTS/03-implement-plan/PLAN-012-merge-short-segments.md
+index c31a564..84f8977 100644
+--- a/CONTEXTS/03-implement-plan/PLAN-012-merge-short-segments.md
++++ b/CONTEXTS/03-implement-plan/PLAN-012-merge-short-segments.md
+@@ -2,8 +2,8 @@
+ id: PLAN-012-merge-short-segments
+ status: draft
+ date: 2026-11-05
+-review_count: 0
+-patch: n/a
++review_count: 1
++patch: applied
+ ---
+ 
+ # PLAN-012: Merge consecutive same-speaker segments under a duration threshold in the stored .srt
+@@ -39,7 +39,12 @@ In scope:
+    fold into the previously written cue while the resulting cue span
+    stays under the threshold. Only the `.srt` on disk changes; socket
+    events, segment indices, assist `#n` tags, `active.finals`, and the
+-   web display are untouched.
++   live socket display path are untouched. Stored-file-derived views
++   (the Review page and the post-reload `backfillFromStored`, both
++   driven by `parseSrt`) necessarily render a merged cue as one
++   segment at the surviving index - that is the point of the feature,
++   and `groupSegments` already renders the same visual grouping
++   pre-merge.
+ 3. Translation routing so a merged cue collects the translations of all
+    contributing segment indices, joined with a space in index order.
+ 4. Automated tests for the merge rule, the two new SRT helpers, the
+@@ -112,7 +117,7 @@ export interface SessionWriterOptions {
+ static async create(
+   rootDir: string,
+   meta: SessionMeta,
+-  log?: WarnLog,
++  log: WarnLog = silentLog, // existing default unchanged
+   opts?: SessionWriterOptions,
+ ): Promise<SessionWriter>;
+ ```
+@@ -193,8 +198,11 @@ correct index order.
+      `mergedCues`, update `lastCue.end_s`, and enqueue the same
+      read -> `extendCue` -> tmp write -> rename cycle
+      `appendTranslation` uses; null -> warn + skip (defensive; the cue
+-     was just written). Otherwise append `formatCue` exactly as today
+-     and reset `lastCue`/`cueOfIndex` for the new cue.
++     was just written). Otherwise append `formatCue` exactly as today,
++     point `lastCue` at the new cue, and record its `cueOfIndex` entry.
++     `cueOfIndex` accumulates for the whole session: earlier entries
++     MUST be kept, because a late translation for a merged-away index
++     still routes through the map.
+    - `appendTranslation(index, text)`: the two-path routing above;
+      non-merged path code unchanged.
+    - `create`, `appendAssist`, `renameSpeakers`, `finalize`, queue:
+@@ -206,8 +214,9 @@ correct index order.
+    broadcasts, translates, and assists every final.
+ 6. `server/app.test.ts`: add `TRANSCRIPT_MERGE_MAX_S: '0'` to the
+    `parseConfig` env in `beforeEach` so the existing e2e suite keeps
+-   exercising the disabled path (two same-speaker finals exist in the
+-   assist suite and would merge under the default `10`). Add one e2e
++   exercising the disabled path (the assist suite emits a same-speaker
++   final pair and the ASSIST_FAILED test a speaker-less pair, both of
++   which would merge under the default `10`). Add one e2e
+    test that builds a second app instance with
+    `TRANSCRIPT_MERGE_MAX_S: '5'`, emits two same-speaker finals, and
+    asserts a single merged cue in `stored.srt`.
+@@ -228,8 +237,9 @@ correct index order.
+     `2->3.4 'there.'` -> single cue `1` with
+     `00:00:00,000 --> 00:00:03,400` and `Speaker 1: Hello. there.`;
+     a third same-speaker seg extends the same cue again (chain merge).
+-  - no merge across different speakers: idx1 `Speaker 2` -> separate
+-    cue `3` (numbering gap is the documented contract).
++  - no merge across different speakers: after idx0+idx1 merge into
++    cue `1`, idx2 `Speaker 2` -> separate cue `3` (numbering gap at
++    `2` is the documented contract).
+   - no merge over threshold: same speaker, `seg.end_s - lastCue.start_s
+     >= mergeMaxS` -> separate cue.
+   - disabled = unchanged: writer created with no opts (and once with
+@@ -269,6 +279,16 @@ correct index order.
+   1` binding); SRT players ignore numbering. Consequence: assist `#n`
+   tags and socket `index` values may reference merged-away indices with
+   no matching cue - cosmetic, consistent with ADR-007's index semantics.
++- `meta.segments` (`cueCount` over the stored `.srt`, surfaced by
++  `listSessions`/`readSession` and shown in the Sessions list) counts
++  stored cues, so a merged session reports fewer "segments" than
++  emitted finals. Cosmetic; consistent with the numbering-gap contract.
++- Merged-cue translation replacement deviates from ADR-007's
++  "skip if already translated" rule for `appendTranslation`, scoped to
++  merged cues only (ADR-007's model had no merged cues; non-merged cues
++  keep the skip rule verbatim). If the reviewer judges this an ADR
++  change rather than a scoped extension, ADR-007 needs a superseding
++  record before implementation - escalate per AGENTS.md.
+ - Transient state: between a merge rewrite and the absorbed segment's
+   translation landing, the cue shows merged source with the pre-merge
+   translation; the merged-cue translation path then rewrites the line to
+-- 
+2.50.0
+
+
+From 48f501c52633cdbd2b6cdc0836fb508b43c06093 Mon Sep 17 00:00:00 2001
+From: Satoshi Man <mrvuong.bitcoin@gmail.com>
+Date: Thu, 5 Nov 2026 21:42:16 +0700
+Subject: [PATCH 4/6] log: verify PLAN-012 and patch divergences
+
+---
+ CONTEXTS/04-logs/2026-11-05.md | 38 ++++++++++++++++++++++++++++++++--
+ 1 file changed, 36 insertions(+), 2 deletions(-)
+
+diff --git a/CONTEXTS/04-logs/2026-11-05.md b/CONTEXTS/04-logs/2026-11-05.md
+index e58cc70..bdc8f9f 100644
+--- a/CONTEXTS/04-logs/2026-11-05.md
++++ b/CONTEXTS/04-logs/2026-11-05.md
+@@ -1,11 +1,11 @@
+ ---
+ date: "2026-11-05"
+-events_count: 89
++events_count: 90
+ ---
+ 
+ # Events on 2026-11-05
+ 
+-Total events: **89**
++Total events: **90**
+ 
+ ## Table of contents
+ 
+@@ -98,6 +98,7 @@ Total events: **89**
+ - [17:58 - Update license copyright to real name](#1758---update-license-copyright-to-real-name)
+ - [18:31 - Standardize workflow name in README](#1831---standardize-workflow-name-in-readme)
+ - [21:39 - Draft PLAN-012: merge short same-speaker transcript segments](#2139---draft-plan-012-merge-short-same-speaker-transcript-segments)
++- [21:42 - Verify PLAN-012 and patch divergences](#2142---verify-plan-012-and-patch-divergences)
+ 
+ ---
+ 
+@@ -3158,3 +3159,36 @@ CONTEXTS/03-implement-plan/PLAN-012-merge-short-segments.md
+ Open assumptions recorded in plan risks: default-on at 10s vs opt-in, strict < threshold, speaker-less segments merge with each other, cue numbering gaps are deliberate
+ 
+ ---
++## 21:42 - Verify PLAN-012 and patch divergences
++
++**Scope:** CONTEXTS/03-implement-plan | **Type:** Docs | **Commit:** dc9dc75 @ doc-centric
++
++## Scope
++CONTEXTS/03-implement-plan
++
++## Type
++Docs
++
++## Commit
++- **Hash:** dc9dc75
++- **Repo:** doc-centric
++- **Message:** Review PLAN-012: patch divergences from verification pass
++- **Author:** Satoshi Man <mrvuong.bitcoin@gmail.com>
++- **Date:** 2026-11-05 21:42:04 +0700
++
++## User request
++Run ONE verification pass on the newest PLAN in CONTEXTS/03-implement-plan/ per AGENTS.md workflow: re-check it against BDRs, ADRs, and the codebase; patch divergences in the plan; update review_count and patch frontmatter. Do NOT implement. Commit only plan changes.
++
++## Reason
++Verification loop requires at least one full pass before a plan may be implemented; five imprecisions found were cheap to fix at plan level. The merged-cue translation replace path may exceed ADR-007's stated appendTranslation contract, so it was surfaced for human escalation rather than silently accepted.
++
++## Description
++Ran one verification pass on PLAN-012 per AGENTS.md: re-checked against BDR-006, ADR-007, ADR-005, ADR-006 and the codebase. Anchors verified (manager.ts SessionWriter.create, STT_IDLE_TIMEOUT_S, insertTranslationLine block-scan, groupSegments speaker equality, app.test.ts parseConfig env). Patched five divergences: wrong cue number in the different-speaker test line, ambiguous cueOfIndex reset wording, overbroad 'web display untouched' claim, undocumented meta.segments undercount, and a create() signature mismatch. Flagged the merged-cue translation replace path as a possible ADR-007 extension needing human judgment. Frontmatter now review_count: 1, patch: applied.
++
++## Files changed
++CONTEXTS/03-implement-plan/PLAN-012-merge-short-segments.md
++
++## Notes
++PLAN-012 stays draft; developer decides reviewed/approved status and whether the ADR-007 deviation warrants a superseding record.
++
++---
+-- 
+2.50.0
+
+
+From 74496f21ce8dec96f9a3d9b5514b382d05c1d0c4 Mon Sep 17 00:00:00 2001
+From: Satoshi Man <mrvuong.bitcoin@gmail.com>
+Date: Thu, 5 Nov 2026 21:47:48 +0700
+Subject: [PATCH 5/6] Merge short same-speaker transcript segments in the
+ stored .srt (PLAN-012)
+
+---
+ .env.example                                  |   4 +
+ .../PLAN-012-merge-short-segments.md          |  14 +-
+ server/app.test.ts                            |  81 ++++++-
+ server/config.test.ts                         |  21 ++
+ server/config.ts                              |   1 +
+ server/session/manager.ts                     |   4 +-
+ server/session/srt.test.ts                    |  62 +++++
+ server/session/srt.ts                         |  53 +++++
+ server/session/writer.test.ts                 | 215 ++++++++++++++++++
+ server/session/writer.ts                      |  97 +++++++-
+ 10 files changed, 539 insertions(+), 13 deletions(-)
+
+diff --git a/.env.example b/.env.example
+index 34b26a5..45bae11 100644
+--- a/.env.example
++++ b/.env.example
+@@ -9,6 +9,10 @@ ASSEMBLYAI_API_KEY=
+ # Seconds of no audio before the STT stream auto-closes (billing hygiene).
+ STT_IDLE_TIMEOUT_S=30
+ 
++# Merge consecutive same-speaker transcript segments into one cue when
++# the merged span stays under this many seconds. 0 disables merging.
++TRANSCRIPT_MERGE_MAX_S=10
++
+ # Primary LLM (OpenAI-compatible). Defaults point at DeepSeek.
+ LLM_BASE_URL=https://api.deepseek.com
+ LLM_API_KEY=
+diff --git a/CONTEXTS/03-implement-plan/PLAN-012-merge-short-segments.md b/CONTEXTS/03-implement-plan/PLAN-012-merge-short-segments.md
+index 84f8977..944051d 100644
+--- a/CONTEXTS/03-implement-plan/PLAN-012-merge-short-segments.md
++++ b/CONTEXTS/03-implement-plan/PLAN-012-merge-short-segments.md
+@@ -1,6 +1,6 @@
+ ---
+ id: PLAN-012-merge-short-segments
+-status: draft
++status: implemented
+ date: 2026-11-05
+ review_count: 1
+ patch: applied
+@@ -10,7 +10,7 @@ patch: applied
+ 
+ ## Status
+ 
+-draft
++implemented
+ 
+ ## Governing records
+ 
+@@ -303,13 +303,13 @@ correct index order.
+ 
+ ## Definition of Done
+ 
+-- [ ] `npm run typecheck` clean; `npm test` green.
+-- [ ] Automated tests cover: merge under threshold, no merge across
++- [x] `npm run typecheck` clean; `npm test` green.
++- [x] Automated tests cover: merge under threshold, no merge across
+       different speakers, no merge over threshold, disabled =
+       byte-identical output.
+-- [ ] `TRANSCRIPT_MERGE_MAX_S` parsed with default `10`, `0` disables,
++- [x] `TRANSCRIPT_MERGE_MAX_S` parsed with default `10`, `0` disables,
+       documented in `.env.example`.
+-- [ ] With merging enabled, a session `.srt` stores merged cues (joined
++- [x] With merging enabled, a session `.srt` stores merged cues (joined
+       source text, extended end time, joined translation line) while
+       socket events and the `.md` are unchanged.
+-- [ ] Plan status updated and completion event logged via `event.py`.
++- [x] Plan status updated and completion event logged via `event.py`.
+diff --git a/server/app.test.ts b/server/app.test.ts
+index 3489e77..4f68c81 100644
+--- a/server/app.test.ts
++++ b/server/app.test.ts
+@@ -6,7 +6,7 @@ import WebSocket from 'ws';
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+ import { buildServer } from './index.js';
+ import { parseConfig } from './config.js';
+-import { filePathFor, wavPathFor } from './session/markdown.js';
++import { filePathFor, srtPathFor, wavPathFor } from './session/markdown.js';
+ import type {
+   Segment,
+   STTProvider,
+@@ -62,6 +62,7 @@ beforeEach(async () => {
+     STT_PROVIDER: 'deepgram',
+     DEEPGRAM_API_KEY: 'dg',
+     LLM_API_KEY: 'llm',
++    TRANSCRIPT_MERGE_MAX_S: '0',
+   });
+   translateSpy = vi.fn(fakeTranslator.translate);
+   assistSpy = vi.fn(async () => ({ question: null, points: [] }));
+@@ -365,6 +366,84 @@ describe('answer assist', () => {
+   });
+ });
+ 
++describe('transcript merge', () => {
++  it('stores one merged cue for consecutive same-speaker finals when enabled', async () => {
++    const provider2 = new FakeProvider();
++    const app2 = await buildServer(
++      parseConfig({
++        STT_PROVIDER: 'deepgram',
++        DEEPGRAM_API_KEY: 'dg',
++        LLM_API_KEY: 'llm',
++        TRANSCRIPT_MERGE_MAX_S: '5',
++      }),
++      {
++        rootDir: dir,
++        providerFactory: () => provider2,
++        translatorFactory: () =>
++          ({ translate: translateSpy }) as Translator,
++        assistantFactory: () =>
++          ({ analyze: assistSpy }) as AnswerAssistant,
++      },
++    );
++    try {
++      const res = await app2.inject({
++        method: 'POST',
++        url: '/api/sessions',
++        payload: { diarize: true },
++      });
++      expect(res.statusCode).toBe(201);
++      const info = res.json() as { id: string };
++      const srtFile = srtPathFor(dir, info.id);
++
++      provider2.emitFinal({
++        text: 'Hello.',
++        speaker: 'Speaker 1',
++        start_s: 0,
++        end_s: 2,
++      });
++      // the first final detours through renameSpeakers before its append,
++      // so wait for the cue before emitting the next final
++      await vi.waitFor(async () => {
++        expect(await fs.readFile(srtFile, 'utf8')).toContain(
++          '00:00:00,000 --> 00:00:02,000',
++        );
++      });
++      provider2.emitFinal({
++        text: 'there.',
++        speaker: 'Speaker 1',
++        start_s: 2,
++        end_s: 3.4,
++      });
++      await vi.waitFor(async () => {
++        const srt = await fs.readFile(srtFile, 'utf8');
++        expect(srt).toContain('Hello. there.');
++        expect(srt).toContain('XIN CHÀO XIN CHÀO');
++      });
++
++      await app2.inject({
++        method: 'POST',
++        url: `/api/sessions/${info.id}/stop`,
++      });
++      const read = await app2.inject({
++        method: 'GET',
++        url: `/api/sessions/${info.id}`,
++      });
++      const stored = read.json() as {
++        srt: string;
++        meta: { segments: number };
++      };
++      expect(stored.meta.segments).toBe(1);
++      expect(stored.srt).toBe(
++        '1\n00:00:00,000 --> 00:00:03,400\n' +
++          'Speaker 1: Hello. there.\n' +
++          'XIN CHÀO XIN CHÀO\n\n',
++      );
++    } finally {
++      await app2.close();
++    }
++  });
++});
++
+ describe('session audio recording', () => {
+   it('recordAudio tees sent PCM into a sibling .wav and serves it', async () => {
+     const res = await app.inject({
+diff --git a/server/config.test.ts b/server/config.test.ts
+index aa3da43..e65903a 100644
+--- a/server/config.test.ts
++++ b/server/config.test.ts
+@@ -51,6 +51,27 @@ describe('parseConfig', () => {
+     ).toThrow(/LLM_FALLBACK_API_KEY/);
+   });
+ 
++  it('parses TRANSCRIPT_MERGE_MAX_S with default 10 and 0 as disable', () => {
++    expect(parseConfig(validEnv).TRANSCRIPT_MERGE_MAX_S).toBe(10);
++    expect(
++      parseConfig({ ...validEnv, TRANSCRIPT_MERGE_MAX_S: '0' })
++        .TRANSCRIPT_MERGE_MAX_S,
++    ).toBe(0);
++    expect(
++      parseConfig({ ...validEnv, TRANSCRIPT_MERGE_MAX_S: '5' })
++        .TRANSCRIPT_MERGE_MAX_S,
++    ).toBe(5);
++  });
++
++  it('rejects a negative or non-numeric TRANSCRIPT_MERGE_MAX_S', () => {
++    expect(() =>
++      parseConfig({ ...validEnv, TRANSCRIPT_MERGE_MAX_S: '-1' }),
++    ).toThrow(/TRANSCRIPT_MERGE_MAX_S/);
++    expect(() =>
++      parseConfig({ ...validEnv, TRANSCRIPT_MERGE_MAX_S: 'abc' }),
++    ).toThrow(/TRANSCRIPT_MERGE_MAX_S/);
++  });
++
+   it('rejects an unknown STT_PROVIDER value', () => {
+     expect(() =>
+       parseConfig({ ...validEnv, STT_PROVIDER: 'whisper' }),
+diff --git a/server/config.ts b/server/config.ts
+index 5857217..7bc01f0 100644
+--- a/server/config.ts
++++ b/server/config.ts
+@@ -11,6 +11,7 @@ const envSchema = z.object({
+   DEEPGRAM_API_KEY: optionalKey,
+   ASSEMBLYAI_API_KEY: optionalKey,
+   STT_IDLE_TIMEOUT_S: z.coerce.number().int().positive().default(30),
++  TRANSCRIPT_MERGE_MAX_S: z.coerce.number().nonnegative().default(10),
+   LLM_BASE_URL: z.url().default('https://api.deepseek.com'),
+   LLM_API_KEY: optionalKey,
+   TRANSLATE_MODEL: z.string().min(1).default('deepseek-flash'),
+diff --git a/server/session/manager.ts b/server/session/manager.ts
+index 7035d0c..3c3ef32 100644
+--- a/server/session/manager.ts
++++ b/server/session/manager.ts
+@@ -183,7 +183,9 @@ export class SessionManager {
+     }
+     let writer: SessionWriter;
+     try {
+-      writer = await SessionWriter.create(this.sessionsDir, meta, this.log);
++      writer = await SessionWriter.create(this.sessionsDir, meta, this.log, {
++        mergeMaxS: this.config.TRANSCRIPT_MERGE_MAX_S,
++      });
+     } catch (err) {
+       await recorder?.abort().catch(() => {});
+       throw err;
+diff --git a/server/session/srt.test.ts b/server/session/srt.test.ts
+index 193afaf..35341dd 100644
+--- a/server/session/srt.test.ts
++++ b/server/session/srt.test.ts
+@@ -1,9 +1,11 @@
+ import { describe, expect, it } from 'vitest';
+ import {
+   cueCount,
++  extendCue,
+   formatCue,
+   formatSrtTimestamp,
+   insertTranslationLine,
++  setCueTranslation,
+ } from './srt.js';
+ 
+ describe('formatSrtTimestamp', () => {
+@@ -87,6 +89,66 @@ describe('insertTranslationLine', () => {
+   });
+ });
+ 
++describe('extendCue', () => {
++  const srt = [
++    '1\n00:00:00,000 --> 00:00:02,000\nSpeaker 1: Hello.',
++    '2\n00:00:05,100 --> 00:00:08,200\nHi there.',
++    '',
++  ].join('\n\n');
++
++  it('extends the end timestamp and appends to the source line', () => {
++    expect(extendCue(srt, 0, 3.4, 'there.')).toBe(
++      [
++        '1\n00:00:00,000 --> 00:00:03,400\nSpeaker 1: Hello. there.',
++        '2\n00:00:05,100 --> 00:00:08,200\nHi there.',
++        '',
++      ].join('\n\n'),
++    );
++  });
++
++  it('preserves an already-present translation line', () => {
++    const withTr = insertTranslationLine(srt, 0, 'Xin chào.')!;
++    const out = extendCue(withTr, 0, 3.4, 'there.');
++    expect(out).toContain('Speaker 1: Hello. there.\nXin chào.');
++  });
++
++  it('returns null when the cue is missing', () => {
++    expect(extendCue(srt, 9, 1, 'x')).toBeNull();
++    expect(extendCue('', 0, 1, 'x')).toBeNull();
++  });
++
++  it('flattens embedded newlines in the appended text', () => {
++    const out = extendCue(srt, 1, 9, 'a\nb')!;
++    expect(out).toContain('Hi there. a b');
++  });
++});
++
++describe('setCueTranslation', () => {
++  const srt = [
++    '1\n00:00:00,000 --> 00:00:03,400\nSpeaker 1: Hello. there.',
++    '2\n00:00:05,100 --> 00:00:08,200\nHi there.',
++    '',
++  ].join('\n\n');
++
++  it('appends a second text line when the cue has only a source line', () => {
++    expect(setCueTranslation(srt, 0, 'Xin chào.')).toContain(
++      'Speaker 1: Hello. there.\nXin chào.',
++    );
++  });
++
++  it('replaces an existing translation line', () => {
++    const withTr = setCueTranslation(srt, 0, 'old joined')!;
++    const out = setCueTranslation(withTr, 0, 'new joined')!;
++    expect(out).toContain('Speaker 1: Hello. there.\nnew joined');
++    expect(out).not.toContain('old joined');
++  });
++
++  it('returns null when the cue is missing', () => {
++    expect(setCueTranslation(srt, 9, 'x')).toBeNull();
++    expect(setCueTranslation('', 0, 'x')).toBeNull();
++  });
++});
++
+ describe('cueCount', () => {
+   it('counts ` --> ` lines', () => {
+     expect(cueCount('')).toBe(0);
+diff --git a/server/session/srt.ts b/server/session/srt.ts
+index 1a13808..e54ac69 100644
+--- a/server/session/srt.ts
++++ b/server/session/srt.ts
+@@ -59,6 +59,59 @@ export function insertTranslationLine(
+   return null;
+ }
+ 
++// Rewrites cue `index + 1` in place: the end timestamp becomes
++// formatSrtTimestamp(endS) and ` ` + oneLine(text) is appended to the
++// first text line (the source line). A translation line already present
++// is preserved untouched. Returns the updated document, or null when the
++// cue is missing.
++export function extendCue(
++  srt: string,
++  index: number,
++  endS: number,
++  text: string,
++): string | null {
++  const blocks = srt.split(/\n{2,}/).filter((b) => b.trim() !== '');
++  const target = String(index + 1);
++  for (let i = 0; i < blocks.length; i++) {
++    const lines = blocks[i]!.split('\n');
++    if (lines[0]?.trim() !== target) continue;
++    const stamp = lines[1];
++    if (!stamp?.includes(' --> ')) continue;
++    lines[1] = `${stamp.split(' --> ')[0]} --> ${formatSrtTimestamp(endS)}`;
++    if (lines[2] !== undefined) {
++      lines[2] = `${lines[2]} ${oneLine(text)}`;
++    }
++    blocks[i] = lines.join('\n');
++    return `${blocks.join('\n\n')}\n\n`;
++  }
++  return null;
++}
++
++// Sets the translation (last text line) of cue `index + 1`: replaces the
++// existing second text line when present, otherwise appends it. Returns
++// the updated document, or null when the cue is missing.
++export function setCueTranslation(
++  srt: string,
++  index: number,
++  text: string,
++): string | null {
++  const blocks = srt.split(/\n{2,}/).filter((b) => b.trim() !== '');
++  const target = String(index + 1);
++  for (let i = 0; i < blocks.length; i++) {
++    const lines = blocks[i]!.split('\n');
++    if (lines[0]?.trim() !== target) continue;
++    if (!lines[1]?.includes(' --> ')) continue;
++    if (lines.length > 3) {
++      lines[lines.length - 1] = oneLine(text);
++    } else {
++      lines.push(oneLine(text));
++    }
++    blocks[i] = lines.join('\n');
++    return `${blocks.join('\n\n')}\n\n`;
++  }
++  return null;
++}
++
+ export function cueCount(srt: string): number {
+   let n = 0;
+   for (const line of srt.split('\n')) {
+diff --git a/server/session/writer.test.ts b/server/session/writer.test.ts
+index 3fcbf12..fca1196 100644
+--- a/server/session/writer.test.ts
++++ b/server/session/writer.test.ts
+@@ -3,6 +3,7 @@ import os from 'node:os';
+ import path from 'node:path';
+ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+ import { parseFrontmatter, type SessionMeta } from './markdown.js';
++import { cueCount } from './srt.js';
+ import { SessionWriter } from './writer.js';
+ 
+ let dir: string;
+@@ -147,3 +148,217 @@ describe('SessionWriter', () => {
+     expect(body).toContain('- `#0` ? Q?');
+   });
+ });
++
++describe('SessionWriter cue merging', () => {
++  it('merges consecutive same-speaker segments under the threshold, chaining', async () => {
++    const w = await SessionWriter.create(
++      dir,
++      meta('2026-11-05-session-1000'),
++      undefined,
++      { mergeMaxS: 10 },
++    );
++    await w.appendSegment(0, {
++      text: 'Hello.',
++      speaker: 'Speaker 1',
++      start_s: 0,
++      end_s: 2,
++    });
++    await w.appendSegment(1, {
++      text: 'there.',
++      speaker: 'Speaker 1',
++      start_s: 2,
++      end_s: 3.4,
++    });
++    expect(await fs.readFile(w.srtPath, 'utf8')).toBe(
++      '1\n00:00:00,000 --> 00:00:03,400\nSpeaker 1: Hello. there.\n\n',
++    );
++
++    // a third same-speaker segment extends the same cue again
++    await w.appendSegment(2, {
++      text: 'again.',
++      speaker: 'Speaker 1',
++      start_s: 3.4,
++      end_s: 5,
++    });
++    expect(await fs.readFile(w.srtPath, 'utf8')).toBe(
++      '1\n00:00:00,000 --> 00:00:05,000\nSpeaker 1: Hello. there. again.\n\n',
++    );
++  });
++
++  it('keeps a different speaker on its own cue, leaving a numbering gap', async () => {
++    const w = await SessionWriter.create(
++      dir,
++      meta('2026-11-05-session-1000'),
++      undefined,
++      { mergeMaxS: 10 },
++    );
++    await w.appendSegment(0, {
++      text: 'Hello.',
++      speaker: 'Speaker 1',
++      start_s: 0,
++      end_s: 2,
++    });
++    await w.appendSegment(1, {
++      text: 'there.',
++      speaker: 'Speaker 1',
++      start_s: 2,
++      end_s: 3.4,
++    });
++    await w.appendSegment(2, {
++      text: 'Reply.',
++      speaker: 'Speaker 2',
++      start_s: 4,
++      end_s: 5,
++    });
++    expect(await fs.readFile(w.srtPath, 'utf8')).toBe(
++      '1\n00:00:00,000 --> 00:00:03,400\nSpeaker 1: Hello. there.\n\n' +
++        '3\n00:00:04,000 --> 00:00:05,000\nSpeaker 2: Reply.\n\n',
++    );
++  });
++
++  it('merges speaker-less segments with each other', async () => {
++    const w = await SessionWriter.create(
++      dir,
++      meta('2026-11-05-session-1000'),
++      undefined,
++      { mergeMaxS: 10 },
++    );
++    await w.appendSegment(0, { text: 'one', start_s: 0, end_s: 1 });
++    await w.appendSegment(1, { text: 'two', start_s: 1, end_s: 2 });
++    expect(await fs.readFile(w.srtPath, 'utf8')).toBe(
++      '1\n00:00:00,000 --> 00:00:02,000\none two\n\n',
++    );
++  });
++
++  it('does not merge when the combined span reaches the threshold', async () => {
++    const w = await SessionWriter.create(
++      dir,
++      meta('2026-11-05-session-1000'),
++      undefined,
++      { mergeMaxS: 5 },
++    );
++    await w.appendSegment(0, {
++      text: 'Hello.',
++      speaker: 'Speaker 1',
++      start_s: 0,
++      end_s: 2,
++    });
++    // span 0 -> 5 equals the threshold; "under" is strict <
++    await w.appendSegment(1, {
++      text: 'there.',
++      speaker: 'Speaker 1',
++      start_s: 2,
++      end_s: 5,
++    });
++    expect(await fs.readFile(w.srtPath, 'utf8')).toBe(
++      '1\n00:00:00,000 --> 00:00:02,000\nSpeaker 1: Hello.\n\n' +
++        '2\n00:00:02,000 --> 00:00:05,000\nSpeaker 1: there.\n\n',
++    );
++  });
++
++  it('produces byte-identical output when merging is off', async () => {
++    const expected =
++      '1\n00:00:00,000 --> 00:00:02,000\nSpeaker 1: Hello.\n\n' +
++      '2\n00:00:02,000 --> 00:00:03,400\nSpeaker 1: there.\n\n';
++    const segs = [
++      { text: 'Hello.', speaker: 'Speaker 1', start_s: 0, end_s: 2 },
++      { text: 'there.', speaker: 'Speaker 1', start_s: 2, end_s: 3.4 },
++    ];
++
++    const w1 = await SessionWriter.create(dir, meta('2026-11-05-session-1000'));
++    await w1.appendSegment(0, segs[0]!);
++    await w1.appendSegment(1, segs[1]!);
++    expect(await fs.readFile(w1.srtPath, 'utf8')).toBe(expected);
++
++    const w2 = await SessionWriter.create(
++      dir,
++      meta('2026-11-05-session-1001'),
++      undefined,
++      { mergeMaxS: 0 },
++    );
++    await w2.appendSegment(0, segs[0]!);
++    await w2.appendSegment(1, segs[1]!);
++    expect(await fs.readFile(w2.srtPath, 'utf8')).toBe(expected);
++  });
++
++  it('joins translations of merged indices in index order', async () => {
++    const w = await SessionWriter.create(
++      dir,
++      meta('2026-11-05-session-1000'),
++      undefined,
++      { mergeMaxS: 10 },
++    );
++    await w.appendSegment(0, {
++      text: 'Hello.',
++      speaker: 'Speaker 1',
++      start_s: 0,
++      end_s: 2,
++    });
++    await w.appendSegment(1, {
++      text: 'there.',
++      speaker: 'Speaker 1',
++      start_s: 2,
++      end_s: 3.4,
++    });
++    await w.appendTranslation(0, 't0');
++    await w.appendTranslation(1, 't1');
++    expect(await fs.readFile(w.srtPath, 'utf8')).toBe(
++      '1\n00:00:00,000 --> 00:00:03,400\nSpeaker 1: Hello. there.\nt0 t1\n\n',
++    );
++  });
++
++  it('keeps a translation that landed before the merge and joins later ones', async () => {
++    const w = await SessionWriter.create(
++      dir,
++      meta('2026-11-05-session-1000'),
++      undefined,
++      { mergeMaxS: 10 },
++    );
++    await w.appendSegment(0, {
++      text: 'Hello.',
++      speaker: 'Speaker 1',
++      start_s: 0,
++      end_s: 2,
++    });
++    await w.appendTranslation(0, 't0');
++    await w.appendSegment(1, {
++      text: 'there.',
++      speaker: 'Speaker 1',
++      start_s: 2,
++      end_s: 3.4,
++    });
++    await w.appendTranslation(1, 't1');
++    expect(await fs.readFile(w.srtPath, 'utf8')).toBe(
++      '1\n00:00:00,000 --> 00:00:03,400\nSpeaker 1: Hello. there.\nt0 t1\n\n',
++    );
++  });
++
++  it('keeps the index + 1 binding with gaps; cueCount counts stored cues', async () => {
++    const w = await SessionWriter.create(
++      dir,
++      meta('2026-11-05-session-1000'),
++      undefined,
++      { mergeMaxS: 10 },
++    );
++    for (const [index, text] of ['a', 'b', 'c'].entries()) {
++      await w.appendSegment(index, {
++        text,
++        speaker: 'S',
++        start_s: index,
++        end_s: index + 1,
++      });
++    }
++    await w.appendSegment(3, {
++      text: 'd',
++      speaker: 'T',
++      start_s: 3,
++      end_s: 4,
++    });
++    const srt = await fs.readFile(w.srtPath, 'utf8');
++    expect(srt).toBe(
++      '1\n00:00:00,000 --> 00:00:03,000\nS: a b c\n\n' +
++        '4\n00:00:03,000 --> 00:00:04,000\nT: d\n\n',
++    );
++    expect(cueCount(srt)).toBe(2);
++  });
++});
+diff --git a/server/session/writer.ts b/server/session/writer.ts
+index 25ea8a9..a4827e5 100644
+--- a/server/session/writer.ts
++++ b/server/session/writer.ts
+@@ -9,7 +9,12 @@ import {
+   srtPathFor,
+   type SessionMeta,
+ } from './markdown.js';
+-import { formatCue, insertTranslationLine } from './srt.js';
++import {
++  extendCue,
++  formatCue,
++  insertTranslationLine,
++  setCueTranslation,
++} from './srt.js';
+ 
+ interface WarnLog {
+   warn: (msg: string) => void;
+@@ -17,6 +22,10 @@ interface WarnLog {
+ 
+ const silentLog: WarnLog = { warn: () => {} };
+ 
++export interface SessionWriterOptions {
++  mergeMaxS?: number; // seconds; > 0 enables merging
++}
++
+ // Three-file session bundle (ADR-007): `.md` frontmatter + `## Assist` body,
+ // bilingual `.srt` cues, sibling `.wav` handled by WavRecorder. All writes
+ // serialize on one internal queue so a translation rewrite can never
+@@ -24,11 +33,22 @@ const silentLog: WarnLog = { warn: () => {} };
+ export class SessionWriter {
+   private queue: Promise<unknown> = Promise.resolve();
+ 
++  private lastCue?: {
++    cueNo: number;
++    speaker: string | undefined;
++    start_s: number;
++    end_s: number;
++  };
++  private readonly cueOfIndex = new Map<number, number>(); // index -> cue number
++  private readonly mergedCues = new Set<number>(); // cue numbers built by merging
++  private readonly cueTranslations = new Map<number, Map<number, string>>(); // cueNo -> index -> text
++
+   private constructor(
+     readonly filePath: string,
+     readonly srtPath: string,
+     private meta: SessionMeta,
+     private log: WarnLog,
++    private readonly mergeMaxS: number,
+   ) {}
+ 
+   get speakers(): Record<string, string> {
+@@ -39,6 +59,7 @@ export class SessionWriter {
+     rootDir: string,
+     meta: SessionMeta,
+     log: WarnLog = silentLog,
++    opts?: SessionWriterOptions,
+   ): Promise<SessionWriter> {
+     const filePath = filePathFor(rootDir, meta.id);
+     const srtPath = srtPathFor(rootDir, meta.id);
+@@ -55,30 +76,98 @@ export class SessionWriter {
+       await fs.unlink(filePath).catch(() => {});
+       throw err;
+     }
+-    return new SessionWriter(filePath, srtPath, meta, log);
++    return new SessionWriter(filePath, srtPath, meta, log, opts?.mergeMaxS ?? 0);
+   }
+ 
+   appendSegment(index: number, seg: Segment): Promise<void> {
++    const last = this.lastCue;
++    // Merge (PLAN-012): a consecutive same-speaker segment folds into the
++    // last cue while the resulting span stays under the threshold. The cue
++    // keeps its original number; the absorbed index leaves a numbering gap.
++    if (
++      this.mergeMaxS > 0 &&
++      last !== undefined &&
++      seg.speaker === last.speaker &&
++      seg.end_s - last.start_s < this.mergeMaxS
++    ) {
++      this.cueOfIndex.set(index, last.cueNo);
++      this.mergedCues.add(last.cueNo);
++      last.end_s = seg.end_s;
++      const cueNo = last.cueNo;
++      return this.enqueue(async () => {
++        const srt = await fs.readFile(this.srtPath, 'utf8');
++        const extended = extendCue(srt, cueNo - 1, seg.end_s, seg.text);
++        if (extended === null) {
++          this.log.warn(
++            `segment ${index} not merged: cue ${cueNo} missing`,
++          );
++          return;
++        }
++        const tmp = `${this.srtPath}.tmp`;
++        await fs.writeFile(tmp, extended);
++        await fs.rename(tmp, this.srtPath);
++      });
++    }
+     const speakerName = seg.speaker
+       ? (this.meta.speakers[seg.speaker] ?? seg.speaker)
+       : undefined;
+     const cue = formatCue(index, seg, speakerName);
++    this.cueOfIndex.set(index, index + 1);
++    this.lastCue = {
++      cueNo: index + 1,
++      speaker: seg.speaker,
++      start_s: seg.start_s,
++      end_s: seg.end_s,
++    };
+     return this.enqueue(() => fs.appendFile(this.srtPath, cue));
+   }
+ 
+   // Translations land after newer cues may already exist, so this is a
+   // read -> splice -> tmp+rename cycle, serialized on the same queue as the
+-  // appends. A missing or already-translated cue logs and skips.
++  // appends. A missing or already-translated cue logs and skips. A cue
++  // built by merging collects the translations of every contributing
++  // index, joined in index order, so the last text line is rewritten
++  // rather than skipped once translated.
+   appendTranslation(index: number, text: string): Promise<void> {
++    const cueNo = this.cueOfIndex.get(index) ?? index + 1;
++    if (this.mergedCues.has(cueNo)) {
++      const translations =
++        this.cueTranslations.get(cueNo) ?? new Map<number, string>();
++      this.cueTranslations.set(cueNo, translations);
++      translations.set(index, text);
++      return this.enqueue(async () => {
++        const joined = [...translations.entries()]
++          .sort(([a], [b]) => a - b)
++          .map(([, t]) => t)
++          .join(' ');
++        const srt = await fs.readFile(this.srtPath, 'utf8');
++        const rewritten = setCueTranslation(srt, cueNo - 1, joined);
++        if (rewritten === null) {
++          this.log.warn(
++            `translation for segment ${index} not written: cue ${cueNo} missing`,
++          );
++          return;
++        }
++        const tmp = `${this.srtPath}.tmp`;
++        await fs.writeFile(tmp, rewritten);
++        await fs.rename(tmp, this.srtPath);
++      });
++    }
+     return this.enqueue(async () => {
+       const srt = await fs.readFile(this.srtPath, 'utf8');
+-      const spliced = insertTranslationLine(srt, index, text);
++      const spliced = insertTranslationLine(srt, cueNo - 1, text);
+       if (spliced === null) {
+         this.log.warn(
+           `translation for segment ${index} not written: cue missing or already translated`,
+         );
+         return;
+       }
++      let perCue = this.cueTranslations.get(cueNo);
++      if (!perCue) {
++        perCue = new Map();
++        this.cueTranslations.set(cueNo, perCue);
++      }
++      perCue.set(index, text);
+       const tmp = `${this.srtPath}.tmp`;
+       await fs.writeFile(tmp, spliced);
+       await fs.rename(tmp, this.srtPath);
+-- 
+2.50.0
+
+
+From 0c2cccfa625e548e8ad381417a899355b07e6d04 Mon Sep 17 00:00:00 2001
+From: Satoshi Man <mrvuong.bitcoin@gmail.com>
+Date: Thu, 5 Nov 2026 21:48:00 +0700
+Subject: [PATCH 6/6] log: merge short same-speaker transcript segments
+
+---
+ CONTEXTS/04-logs/2026-11-05.md | 47 ++++++++++++++++++++++++++++++++--
+ 1 file changed, 45 insertions(+), 2 deletions(-)
+
+diff --git a/CONTEXTS/04-logs/2026-11-05.md b/CONTEXTS/04-logs/2026-11-05.md
+index bdc8f9f..b0039ea 100644
+--- a/CONTEXTS/04-logs/2026-11-05.md
++++ b/CONTEXTS/04-logs/2026-11-05.md
+@@ -1,11 +1,11 @@
+ ---
+ date: "2026-11-05"
+-events_count: 90
++events_count: 91
+ ---
+ 
+ # Events on 2026-11-05
+ 
+-Total events: **90**
++Total events: **91**
+ 
+ ## Table of contents
+ 
+@@ -99,6 +99,7 @@ Total events: **90**
+ - [18:31 - Standardize workflow name in README](#1831---standardize-workflow-name-in-readme)
+ - [21:39 - Draft PLAN-012: merge short same-speaker transcript segments](#2139---draft-plan-012-merge-short-same-speaker-transcript-segments)
+ - [21:42 - Verify PLAN-012 and patch divergences](#2142---verify-plan-012-and-patch-divergences)
++- [21:47 - Implement PLAN-012: merge short same-speaker .srt segments](#2147---implement-plan-012-merge-short-same-speaker-srt-segments)
+ 
+ ---
+ 
+@@ -3192,3 +3193,45 @@ CONTEXTS/03-implement-plan/PLAN-012-merge-short-segments.md
+ PLAN-012 stays draft; developer decides reviewed/approved status and whether the ADR-007 deviation warrants a superseding record.
+ 
+ ---
++## 21:47 - Implement PLAN-012: merge short same-speaker .srt segments
++
++**Scope:** server/session, server/config | **Type:** Feature | **Commit:** 74496f2 @ doc-centric
++
++## Scope
++server/session, server/config
++
++## Type
++Feature
++
++## Commit
++- **Hash:** 74496f2
++- **Repo:** doc-centric
++- **Message:** Merge short same-speaker transcript segments in the stored .srt (PLAN-012)
++- **Author:** Satoshi Man <mrvuong.bitcoin@gmail.com>
++- **Date:** 2026-11-05 21:47:48 +0700
++
++## User request
++Implement the newest PLAN in CONTEXTS/03-implement-plan/ exactly per its scope and DoD. Commit, tick DoD items, set status: implemented, and log via CONTEXTS/04-logs/event.py.
++
++## Reason
++PLAN-012 (review_count 1, patch applied, developer instruction to implement). Merging is on by default at 10s with 0 as the disable switch; span comparison is strict <; speaker equality is on the raw label so speaker-less runs merge like groupSegments. Translation join is map-driven so out-of-order arrivals render in index order.
++
++## Description
++Added TRANSCRIPT_MERGE_MAX_S (default 10, 0 disables) parsed via zod in config.ts and documented in .env.example. SessionWriter gained mergeMaxS plus lastCue/cueOfIndex/mergedCues/cueTranslations bookkeeping: consecutive same-speaker segments fold into the previous cue via extendCue while the span stays under the threshold, leaving numbering gaps that preserve the index+1 cue binding. appendTranslation routes merged-away indices to the surviving cue and rewrites the last text line with all contributing translations joined in index order (setCueTranslation); non-merged cues keep the skip-if-translated contract. New srt.ts helpers extendCue and setCueTranslation follow the insertTranslationLine block-scan pattern. manager.ts passes the config value into SessionWriter.create. Tests: srt helper unit tests, writer merge describe (threshold, speaker switch, speaker-less, chain, disabled-identical, translation ordering, numbering), config parsing tests, and an app e2e with a second instance at mergeMaxS=5 asserting one merged cue with joined translation. Existing e2e suite pinned to TRANSCRIPT_MERGE_MAX_S=0.
++
++## Files changed
++.env.example
++CONTEXTS/03-implement-plan/PLAN-012-merge-short-segments.md
++server/app.test.ts
++server/config.test.ts
++server/config.ts
++server/session/manager.ts
++server/session/srt.test.ts
++server/session/srt.ts
++server/session/writer.test.ts
++server/session/writer.ts
++
++## Notes
++Merged-cue translation rewrite deviates from ADR-007's skip-if-translated rule scoped to merged cues only, as recorded in the plan. meta.segments counts stored cues so merged sessions show fewer segments than emitted finals (documented cosmetic consequence). Manual live-session player check not performed; automated coverage substitutes.
++
++---
+-- 
+2.50.0
+

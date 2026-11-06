@@ -1,0 +1,53 @@
+I'll explore the repository structure and the translation pipeline first.Now let me look at the governing ADR, the assist-side client for comparison, and an existing plan for format reference.The translator uses the `openai` SDK with `maxRetries: 0`, so retries must be implemented in our layer. Let me check how the SDK surfaces network/HTTP errors so the plan can pin the classification precisely.SDK error taxonomy is clear: `APIConnectionError`/`APIConnectionTimeoutError` for network+timeout, `APIError.status` for HTTP codes. Let me check git state and the log to match conventions before drafting the plan.Conventions noted: paired `log:` commits exist for each change. Let me quickly check how the server logs warnings and how the session manager consumes `TranslationError`, so the plan's failure-path contract is accurate.There's already a manager-level retry (`translateSegment` requeues). Let me check its constants.I have the full picture now. Key finding: `SessionManager.translateSegment` already retries the whole `translate()` call (3 attempts, 5s spacing) and broadcasts `TRANSLATION_FAILED` — that's the existing error path the new in-call retry must feed into. I'll draft PLAN-012.Now commit the plan document only, then log the planning event per the repo workflow.Done. Drafted `CONTEXTS/03-implement-plan/PLAN-012-translation-retry-backoff.md` and committed only that document (`c3c9df5`), plus the workflow-required log event (`c9eb909`).
+
+Key decisions pinned in the plan:
+
+- **New module** `server/translate/retry.ts`: `withRetries` + `isRetryableError`. Retryable = `APIConnectionError` (covers timeouts) or a numeric `status` of 429/5xx. Other 4xx, aborts, plain errors, and the "empty translation response" `TranslationError` fail immediately.
+- **Wiring**: `OpenAICompatTranslator.request()` wraps its existing body in `withRetries`; constructor gains an optional `retryOptions` param so tests inject `sleep`/`random`. `translate()`, `makeTranslator`, and `maxRetries: 0` stay untouched.
+- **Schedule**: 500ms → 1000ms nominal, +0-25% jitter, 3 attempts per endpoint call.
+- **Error path**: exhausted failures propagate unwrapped into `translate()`'s existing `TranslationError` and the manager's `TRANSLATION_FAILED` path.
+
+Recorded assumptions in Risks: the 3-attempt budget is per endpoint (fallback keeps its own budget, worst case 6 HTTP calls per `translate()`); combined with the existing manager-level retry, a persistently down provider could see up to 18 calls per segment.
+
+Per the gate in AGENTS.md, the plan is `review_count: 0` — it needs a verification pass and your approval before implementation.
+I'll start by finding the newest plan and the governing records.Now let me read the governing records and the relevant code.Now the code files the plan references.Now let me check `SessionManager.translateSegment`, the openai package version, and the SDK's exported error classes.Code and SDK facts check out so far. Let me verify a few remaining details: named exports from `openai`, package.json scripts, and the assist client's scope claim.Nearly all facts check out. Two details left: `APIUserAbortError`'s status, and the `APIError` constructor signature in the TS types.All SDK and code facts verified. Let me check whether other plans include a per-component cost estimate, since BDR-002's consequences mention one.Verification complete. I checked every pinned claim against the code, the ADRs/BDRs, and the actual `openai@7.45.1` package in `node_modules`. Findings:
+
+**Verified accurate:**
+- `maxRetries: 0` in `defaultClientFactory`, `MAX_TRANSLATION_ATTEMPTS = 3`, `RETRY_DELAY_MS * attempt` requeue in `translateSegment` ([manager.ts:378-415](file://~/fluent-bench/runs/T2/doc-centric/server/session/manager.ts))
+- 3-arg constructor + `makeTranslator` call site; optional 4th param is backwards compatible
+- SDK facts: `APIConnectionTimeoutError instanceof APIConnectionError` = true; `APIConnectionError`/`APIUserAbortError` have `status: undefined`; `new APIError(status, undefined, msg, undefined)` and `new APIConnectionError({ message })` constructors match the TS types; all classes are named exports
+- Existing tests' plain `Error` fakes are non-retryable, so call-count assertions stay valid
+- ADR-003 primary-then-fallback shape preserved; fallback-after-exhaustion test covers its mandated acceptance; ADR-005 (no new env) and ADR-006 (vitest, co-located tests, `.js` import suffix) respected; BDR-002 cost impact addressed
+
+**Two factual slips worth patching (both in descriptive prose, no contract impact):**
+1. "5s spacing" for `RETRY_DELAY_MS * attempt` — actual schedule is linear backoff (5s after attempt 1, 10s after attempt 2)
+2. "Worst case adds ~1.5s of sleep" — with `jitterRatio: 0.25`, max sleep is 625 + 1250 = ~1.9s per endpoint call
+
+Patching both now, plus frontmatter (`review_count: 0→1`, `patch: n/a→applied`).One more instance of "5s spacing" in the Risks section needs the same fix.Fix the line wrap to match the file's ~72-column style.Let me clean up that bullet's wrapping properly.Plan patched. Now commit the plan changes only, matching repo commit style.Verification pass complete on `PLAN-012-translation-retry-backoff.md`.
+
+**Result:** the plan's pinned contracts all check out against the codebase and the installed `openai@7.45.1` SDK. Verified:
+
+- `maxRetries: 0`, the `TranslationError` wrapping path, and the 3-arg constructor/`makeTranslator` call site in `openai-compat.ts`
+- `MAX_TRANSLATION_ATTEMPTS = 3` / `RETRY_DELAY_MS * attempt` requeue in `translateSegment`
+- SDK error classes: `APIConnectionTimeoutError` is a subclass of `APIConnectionError`; `APIConnectionError`/`APIUserAbortError` carry `status: undefined`; the `APIError`/`APIConnectionError` constructor signatures used in the test plan typecheck
+- ADR-003 (primary-then-single-fallback preserved), ADR-005 (no new env vars), ADR-006 (vitest, `.js` import suffix, co-located tests), BDR-002 (bounded cost impact addressed)
+
+**Patched divergences** (descriptive prose only; no contract or step changes):
+- Manager-level retry described as "5s spacing" → corrected to linear backoff (5s after attempt 1, 10s after attempt 2), in both Context and Risks
+- "Worst case adds ~1.5s of sleep" → corrected to up to ~1.9s at max jitter (625ms + 1250ms)
+
+**Frontmatter:** `review_count: 0 → 1`, `patch: n/a → applied`, `status` left as `draft` (only the developer can advance it).
+
+**Commits:** `53743f4` (plan patch only) and `e719f37` (workflow log event, `--no-commit`).
+
+The plan now clears the implementation gate (`review_count >= 1`, `patch: applied`) but still needs your `reviewed`/`approved` status before implementation. One flagged assumption awaits your call: the 3-attempt budget is per endpoint, so worst case is 6 HTTP calls per `translate()` when a fallback is configured.
+PLAN-012 has `review_count: 1` and `patch: applied`, so the hard gate passes. Let me examine the codebase.SDK error classes confirmed. Now implementing step 1 - the new retry module.Step 2 - wire `withRetries` into the translator.Step 3 - write the retry tests.Now extend the translator test file with the retry cases.Running typecheck and tests to verify.All 158 tests pass. Verifying typecheck separately since output interleaved.Both gates pass. Checking recent commit/log conventions before committing.All gates pass. Now ticking the DoD items in the plan and setting status to implemented.Committing code and the plan record together so the completion event binds to a commit containing all touched files.Now logging the completion event via event.py.Event logged and bound to `c0f0db7`. Committing the log file.PLAN-012 implemented and closed out. Summary:
+
+**Changes** (`c0f0db7`):
+- `server/translate/retry.ts` (new): `withRetries`, `isRetryableError`, `RetryOptions` with pinned defaults (3 attempts, 500ms base, 25% jitter). Retryable = `APIConnectionError` (incl. timeouts) or numeric `status` 429/5xx; everything else rethrows immediately.
+- `server/translate/openai-compat.ts`: optional 4th constructor param `retryOptions`; the request body (create call, speaker-label strip, empty-response check) now runs inside `withRetries`. `translate()`, `makeTranslator`, and `maxRetries: 0` are unchanged, so exhausted failures still surface as `TranslationError` into the session-manager path.
+- Tests: new `retry.test.ts` (classification + `[500, 1000]` delay schedule via injected `sleep`/`random`) and 5 new translator cases covering 5xx-then-success, immediate 4xx, exhaustion, connection-error retry, and fallback-after-exhaustion.
+
+**Verification**: `npm run typecheck` clean; `npm test` 158/158 pass. `event.py git verify` confirms the event matches commit `c0f0db7` (5/5 files).
+
+**Closeout**: all 5 DoD items ticked, `status: implemented` in [PLAN-012-translation-retry-backoff.md](file://~/fluent-bench/runs/T2/doc-centric/CONTEXTS/03-implement-plan/PLAN-012-translation-retry-backoff.md), event logged in `CONTEXTS/04-logs/2026-11-05.md` and committed as `db11769`.

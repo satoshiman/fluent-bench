@@ -1,0 +1,80 @@
+>>> T1 doc-centric(split) 20:27:25
+[20:29:39] T1 plan done
+[20:31:28] T1 review done
+[20:34:05] T1 impl done
+<<< T1 doc-centric done
+>>> T2 doc-centric(split) 20:34:05
+[20:39:31] T2 plan done
+[20:44:07] T2 review done
+[20:46:54] T2 impl done
+<<< T2 doc-centric done
+Preparing worktree (new branch 'bench/T3-ad-hoc')
+run ready: ~/fluent-bench/runs/T3/ad-hoc
+base commit: 1349265
+>>> T3 ad-hoc 20:46:54
+<<< T3 ad-hoc done
+Preparing worktree (new branch 'bench/T3-doc-centric')
+run ready: ~/fluent-bench/runs/T3/doc-centric
+base commit: 81dd398
+>>> T3 doc-centric(split) 20:55:25
+[21:02:44] T3 plan done
+[21:06:37] T3 review done
+[21:11:57] T3 impl done
+<<< T3 doc-centric done
+Preparing worktree (new branch 'bench/T4-doc-centric')
+run ready: ~/fluent-bench/runs/T4/doc-centric
+base commit: 81dd398
+>>> T4 doc-centric(split) 21:11:57
+[21:13:39] T4 plan done
+[21:15:05] T4 review done
+[21:18:47] T4 impl done
+<<< T4 doc-centric done
+Preparing worktree (new branch 'bench/T4-ad-hoc')
+run ready: ~/fluent-bench/runs/T4/ad-hoc
+base commit: 5b29161
+>>> T4 ad-hoc 21:18:48
+<<< T4 ad-hoc done
+Preparing worktree (new branch 'bench/T5-doc-centric')
+run ready: ~/fluent-bench/runs/T5/doc-centric
+base commit: 81dd398
+>>> T5 doc-centric(split) 21:20:39
+[21:24:04] T5 plan done
+[21:27:20] T5 review done
+[21:31:40] T5 impl done
+<<< T5 doc-centric done
+Preparing worktree (new branch 'bench/T5-ad-hoc')
+run ready: ~/fluent-bench/runs/T5/ad-hoc
+base commit: 33f66cf
+>>> T5 ad-hoc 21:31:40
+<<< T5 ad-hoc done
+Preparing worktree (new branch 'bench/T6-doc-centric')
+run ready: ~/fluent-bench/runs/T6/doc-centric
+base commit: 81dd398
+>>> T6 doc-centric(split) 21:33:13
+[21:39:13] T6 plan done
+[21:42:23] T6 review done
+[21:48:07] T6 impl done
+<<< T6 doc-centric done
+Preparing worktree (new branch 'bench/T6-ad-hoc')
+run ready: ~/fluent-bench/runs/T6/ad-hoc
+base commit: ba612fe
+>>> T6 ad-hoc 21:48:08
+<<< T6 ad-hoc done
+Preparing worktree (new branch 'bench/chain')
+HEAD is now at 81dd398 log: standardize workflow name in README
+>>> C1 doc-centric(split) 21:53:22
+[21:57:52] C1 plan done
+[22:01:20] C1 review done
+[22:03:36] C1 impl done
+<<< C1 doc-centric done
+>>> C2 doc-centric(split) 22:03:36
+[22:08:21] C2 plan done
+[22:10:55] C2 review done
+[22:13:59] C2 impl done
+<<< C2 doc-centric done
+>>> C3 doc-centric(split) 22:13:59
+[22:17:09] C3 plan done
+[22:21:48] C3 review done
+[22:28:12] C3 impl done
+<<< C3 doc-centric done
+=== ALL DONE ===

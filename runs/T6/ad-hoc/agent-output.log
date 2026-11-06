@@ -1,0 +1,33 @@
+I'll start by exploring the workspace structure.Let me check the existing tests and how the UI/routes consume these files.Let me check how the web UI renders `final`/`translation` events keyed on index.I have the full picture now. The architecture:
+
+- STT `Segment`s flow through `SessionManager.handleFinal` → `SessionWriter.appendSegment(index, seg)` → numbered cues in the persisted `.srt`; translations splice back in by index via `insertTranslationLine`; the `.md` holds frontmatter + `#index` assist blocks.
+- Display already groups same-speaker runs (`transcript-groups.ts`); the gap is the stored `.srt` cue noise — so merging belongs in `SessionWriter`.
+
+Design:
+
+- `TRANSCRIPT_MERGE_MAX_S` env (config): `0` = disabled, default `10`.
+- Writer merges an incoming segment into the previous cue when same non-empty speaker and merged span `seg.end_s - cueStart_s < threshold` — rewrite the last cue block (extend end timestamp, space-join text, preserve any landed translation line).
+- Track `index → first-index` for merged segments so `appendTranslation` lands them in the right cue, space-joined (mirroring the source merge). Disabled path is byte-identical.
+
+Let me write a plan and implement.Now the writer changes:Now the config plumbing:Now the tests in `writer.test.ts`:`silentLog` isn't exported from writer.ts — the tests need `undefined` (which triggers the default param):Let me also add unit tests for the new srt helpers covering the translation-preservation edge case:Let me match the codebase's line-width convention on my additions:Let me check `config.test.ts` and `app.test.ts` for anything that enumerates env keys or constructs a `Config` literal:`app.test.ts` builds config via `parseConfig` — merge defaults ON there, so existing `.srt` assertions may now see folded cues. Let me check what it asserts:Let me scan all `emitFinal` calls for same-speaker consecutive pairs that could now fold:Existing app tests are safe — the only same-speaker pair folds but its test only asserts `.md` assist output. Let me check the `Segment` type and then run the tests:All 158 tests pass. Now typecheck:`exactOptionalPropertyTypes` — the property must explicitly allow `undefined`:Both green. Let me do a final self-review of the writer diff and verify no em dashes slipped into the files (per the user's style rule):Let me check whether the README documents env vars (for consistency):All done and verified. Here's a summary:
+
+## What changed
+
+Same-speaker cue folding lands in the write path, so it applies to the persisted session bundle (the bilingual `.srt` transcript + the `.md` whose `#index` assist tags and `speakers` frontmatter stay keyed to the unchanged socket indices).
+
+- **`server/session/srt.ts`** — two new helpers: `mergeCueText` stretches the last cue's end timestamp and space-joins the incoming text onto the source line (preserving a translation that already landed); `upsertTranslationLine` pushes a translation line or space-joins onto an existing one. [srt.ts:40-86](file://~/fluent-bench/runs/T6/ad-hoc/server/session/srt.ts)
+- **`server/session/writer.ts`** — `SessionWriter.create` takes `opts.mergeMaxS` (default `0` = off). `appendSegment` folds a segment into the previous cue when the speaker label matches and the merged span `end_s - cueStart` stays under the threshold. Merged cues keep the first segment's cue number, so the `index+1` ↔ socket-index mapping used by translations and the backfill parser stays intact. `cueIndexFor` routes a folded index's translation into the right cue. [writer.ts:80-136](file://~/fluent-bench/runs/T6/ad-hoc/server/session/writer.ts)
+- **`server/config.ts`** + **`.env.example`** — `TRANSCRIPT_MERGE_MAX_S`, coerce number, `0` disables, default `10`. <ref_snippet file="~/fluent-bench/runs/T6/ad-hoc/server/config.ts" line="22"/>
+- **`server/session/manager.ts`** — passes `config.TRANSCRIPT_MERGE_MAX_S` into the writer. [manager.ts:186-188](file://~/fluent-bench/runs/T6/ad-hoc/server/session/manager.ts)
+
+## Design notes
+
+- Segments with no speaker label never fold — gluing unlabeled text isn't safe.
+- Disabled path (`mergeMaxS: 0`) takes the exact original code path; the merge branch is skipped before any state changes.
+- All file mutations serialize on the writer's existing queue, so a merge rewrite can't interleave with a translation splice.
+
+## Tests added (10)
+
+In `writer.test.ts`: merge under threshold, translation routing+space-joining into the folded cue, no merge across speakers, no merge at threshold, unlabeled no-merge, `mergeMaxS: 0` = byte-identical output, new-run cue numbering. In `srt.test.ts`: unit coverage for the merge helper (translation-line preservation, empty file) and the upsert helper.
+
+`npm test`: 158 pass (16 files). `npm run typecheck`: clean.

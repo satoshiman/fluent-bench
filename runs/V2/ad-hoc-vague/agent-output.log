@@ -1,0 +1,14 @@
+Let me find the translation call in the codebase.Now let me check how the translator is called and whether the codebase already has retry/sleep utilities.The session manager already retries failed translations. Let me check its constants.The session manager already retries whole translations 3× on a 5s backoff, but inside `OpenAICompatTranslator` each endpoint request is a single shot (`maxRetries: 0`), so a transient network blip on the primary immediately burns the fallback attempt. Let me check the OpenAI SDK version for its error classes before adding in-request retries for transient errors.OpenAI SDK v7 — `APIConnectionError` covers network failures. Let me verify the `APIError` constructor signature for tests.Now I'll add per-request retries for transient errors (connection failures, timeouts, 5xx, 429, 408) inside the translator's `request`, so a network blip doesn't burn the fallback attempt.Now I'll add tests covering the retry behavior. First, the test file needs a value import of `OpenAI` to construct SDK errors.Let me clean up that test block — I left a stray line and the helper is clunkier than needed.Now let me typecheck and run the tests.Translate tests pass. Let me run the full suite to check nothing else regressed.Done. All 148 tests pass.
+
+What I changed in `server/translate/openai-compat.ts`:
+
+- Wrapped the `chat.completions.create` call in `request()` with a `withRetry` helper: up to 3 attempts per endpoint with exponential backoff (250ms base, 2s cap) plus jitter.
+- Added `isTransientError`, which classifies what's worth retrying by walking the cause chain:
+  - `OpenAI.APIConnectionError` (covers socket failures, DNS, and `APIConnectionTimeoutError`)
+  - HTTP 408, 409, 425, 429, and any 5xx
+  - raw Node/undici codes (`ECONNRESET`, `ETIMEDOUT`, `ECONNREFUSED`, `EAI_AGAIN`, `UND_ERR_*`, etc.), so it also works for non-SDK `clientFactory` clients
+- Non-transient errors (400/401, empty responses, aborts) still fail through immediately to the fallback, and `maxRetries: 0` stays on the SDK client so this remains the single fast retry layer.
+
+How the layers now stack for a segment: primary retries transient blips up to 3 quick attempts, then the fallback endpoint does the same, and the session manager's existing 3-attempt loop with 5s backoff still sits on top for hard failures.
+
+Tests added in `openai-compat.test.ts` cover: recovery after transient `ECONNRESET`, SDK connection/5xx errors retrying before falling back, and exhaustion on both endpoints producing `TranslationError`.

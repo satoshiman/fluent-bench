@@ -1,0 +1,55 @@
+I'll explore the workspace to understand the codebase structure and the Review page's audio player.The player already has a `cycleRate` control. Let me check the Review page and how transcript sync works.The player already has a rate cycle button, but it lacks 0.75x. Let me check the test setup, UI kit, and relevant ADRs/plans before drafting.Let me check the Select component and the Live page usage for styling patterns.Let me check the format conventions of existing plans (DoD, sections).I have the full picture. Now let me verify the log tooling exists and check BDR/ADR references I'll cite.Now I'll write the plan document.The event bound to the plan commit. Now commit the log file, matching the repo's "log:" convention.Done. Drafted `PLAN-012-review-playback-speed` and committed only the plan document, plus the required log event.
+
+Key findings baked into the plan:
+
+- `SessionAudioPlayer` in `web/src/components/audio-player.tsx` already has a cycling speed button (`RATES = [1, 1.25, 1.5, 2]`), so the spec is only partially met: 0.75x is missing and a cycle button has no persistent "selected" state.
+- Pinned decision: replace the cycle button with a compact shadcn `Select` (existing `ui/select.tsx`, styled like the ghost transport buttons) offering all five speeds, applied via both `audio.playbackRate` and `audio.defaultPlaybackRate` so the choice survives a media reload.
+- Transcript sync needs no change: highlighting derives from `currentTime`, which is rate-independent.
+- Tests: no DOM test infra exists (`vitest` node env, no testing-library), so the plan extracts `PLAYBACK_RATES` + helpers into `web/src/lib/playback-rates.ts` with a new unit test.
+- Assumptions recorded in Risks/notes, including the minimal fallback (just extend `RATES` on the existing cycle button).
+
+Plan frontmatter is `status: draft`, `review_count: 0`, `patch: n/a` — per the hard gate it cannot be implemented until a verification pass runs and you approve.
+
+Commits: `dd7575e` (plan), `97415c5` (log event).
+I'll run a verification pass on the newest plan. Let me first find it and gather the governing context.PLAN-012 is the newest. Let me read it and the governing records.Now reading the cited ADRs, BDR-002, and the code the plan touches.Now checking the Select component's actual API (the plan writes literal JSX against it), Review.tsx usage, and the cited plans' statuses.The Select component is Base UI (`@base-ui/react`), not Radix — so I need to verify the plan's literal contract against the installed API. Let me check the installed version's prop signatures and the `Select.Value` label behavior.`resolveSelectedLabel` confirms it: without an `items` prop or a children function, `<Select.Value />` renders the **raw value** (`"1"`), not the item's label (`"1x"`). The plan's literal contract `<SelectValue />` would violate its own DoD ("the trigger shows the new `Nx` label"). That's a real divergence. Let me finish checking a few remaining claims, then look at git state.A `log: review playback speed plan` commit already exists. Let me check what it contains before proceeding.The prior commit was just the draft log — the plan itself is still `review_count: 0`. One more check on the `cn` package (class-merge behavior the plan's trigger styling relies on), then I'll patch.All verified. `cn` is a tailwind-merge replacement, so the class overrides in the contract work. Verification complete — here is the scorecard:
+
+**Verified accurate:**
+- `audio-player.tsx`: `RATES = [1, 1.25, 1.5, 2]` + `cycleRate` (lines 27, 102-107), `useState(1)` (line 55), cycle `Button` with `aria-label="Playback speed"` (lines 188-196) — all as described
+- `Review.tsx`: `onTimeUpdate` → `onTime` → `activeCueIndex` chain (lines 86-89); player mounted once per view, props unchanged
+- `select.tsx`: shadcn-generated, Base UI backed; `SelectTrigger size="sm"` → `h-7`, `SelectContent alignItemWithTrigger` supported, portal `isolate z-50` over the `z-10` sticky card — all confirmed
+- `onValueChange` signature `(value, eventDetails)` — plan's `(v) => applyRate(Number(v))` typechecks; `null`/`NaN` rejected by `isPlaybackRate`
+- vitest `environment: 'node'`, include pattern covers `web/src/lib/*.test.ts`; no testing-library — the lib-extraction rationale holds
+- `npm test` / `npm run typecheck` / `npm run dev` exist; `@base-ui/react` already installed (BDR-002 zero cost)
+- PLAN-010 / PLAN-011 are `implemented`; ADR-001/ADR-006/BDR-002 citations hold
+
+**Divergence found (1):** Base UI `Select.Value` does NOT read labels from popup items — `resolveSelectedLabel` falls back to `serializeValue(value)` unless `items` or `itemToStringLabel` is passed to Root. The contract's bare `<SelectValue />` would render `"1"`, not `"1x"`, violating the plan's own acceptance criterion. Patching the contract to the documented function-child form.Plan patched. Now committing only the plan file, matching the repo's commit style (no attribution per global rules).The event bound correctly to the plan commit (`0bb561f`). Committing the log file per the repo's `log:` convention.Verification pass complete on **PLAN-012-review-playback-speed** (the newest plan, previously `review_count: 0`).
+
+**Checked against:**
+- BDRs: BDR-002 zero-cost holds (pure DOM API, `@base-ui/react` already a dependency); BDR-006's artifact bundle untouched (pure UI change)
+- ADRs: ADR-001 (frontend-only, no backend surface) and ADR-006 (React/TS/Tailwind/shadcn, vitest node env, `tsc --noEmit` gate) both satisfied; `select.tsx` is a CLI-generated shadcn component, no new deps
+- Codebase: every code-level claim verified — `RATES`/`cycleRate`/`useState(1)`/the `{rate}x` ghost button all at the cited spots in `audio-player.tsx`, `onTime` → `activeCueIndex` chain in `Review.tsx`, player mounted once per view, `z-50` portal over the `z-10` sticky card, test include pattern covers `web/src/lib/*.test.ts`, and `npm test`/`typecheck`/`dev` scripts exist
+
+**Divergence patched (1):**
+- `select.tsx` wraps **Base UI**, not Radix. `<Select.Value />` resolves its label only from `items`/`itemToStringLabel`/function children — popup items are never consulted, so the contract's bare `<SelectValue />` would have rendered `"1"` instead of `"1x"`, failing the plan's own DoD. Patched to `{(v) => rateLabel(Number(v))}`, documented the finding in Risks, and pinned the import lists in Step 2.
+
+**Frontmatter:** `review_count: 0 → 1`, `patch: n/a → applied`. `status` stays `draft` — only the developer moves that.
+
+**Commits:** `0bb561f` (plan file only), `144dc9f` (workflow log entry bound to the plan commit). No implementation performed; the plan now meets the review threshold for developer approval.
+The newest plan is PLAN-012 (playback speed control on the Review player). It passes the hard gate: `review_count: 1`, `patch: applied`. Let me read the files it touches.Root `typecheck` only covers server/scripts; the web app typechecks via `tsc -b` in `web/`. Let me check how `@/lib` imports are used elsewhere, then implement.Now implementing. Step 1: create the lib module and its test.Step 2: update `audio-player.tsx`.Now verify: run vitest, root typecheck, and web `tsc -b` (covers the tsx file).All green. Quick lint check on the web side too.Pre-existing warnings only. Now let me check whether there's a recorded session with audio I can use for the manual verification steps.A session fixture needs `<id>.md` + `<id>.srt` + `<id>.wav` under `sessions/`. Let me check the expected formats.`sessions/` is gitignored — I'll create a temporary fixture there. Let me check the SRT cue format expected by `parseSrt`.Now I'll create a temporary fixture session and check whether the server needs env keys to boot.I'll build the web app and boot the server with dummy keys (only session routes are needed).Server up, fixture session serves. Now the browser check via the playwright-cli skill.Page renders with the new `Playback speed` combobox showing `1x`. Now press Play and open the speed menu.All five options render; `1x` is selected. Select `0.75x` and verify the audio element.The 7s clip ended before I could check mid-playback behavior. I'll generate a 60s tone WAV and extend the fixture.Audio is mid-playback at t≈28.5, rate 1. Now switch to 2x live.2x applied mid-playback: t went 38→40.6→44.7 (≈2x wall time, no restart, `paused:false`). Check the active cue highlight and menu check state.Highlight tracks correctly (00:40 cue active at t≈45). Reopen the menu to confirm 2x stays checked.`2x` stays checked. Now select 0.75x and test timestamp seek.Rate 0.75 confirmed (clip had ended, so let me click a timestamp to verify seek + playback at 0.75x).All checks pass: seek lands on cue 0, plays at 0.75x, highlight correct. Cleanup: close browser, stop server, remove the fixture.DoD all ticked, status set. Now commit and log.PLAN-012 implemented and closed out.
+
+**Changes**
+- `web/src/lib/playback-rates.ts` - new: `PLAYBACK_RATES` `[0.75, 1, 1.25, 1.5, 2]`, `PlaybackRate`, `DEFAULT_PLAYBACK_RATE`, `isPlaybackRate`, `rateLabel` per the literal contract.
+- `web/src/lib/playback-rates.test.ts` - new vitest coverage per Step 3.
+- `web/src/components/audio-player.tsx` - cycling ghost `Button` replaced with the contracted Base UI `Select`; `applyRate` validates via `isPlaybackRate` and writes both `playbackRate` and `defaultPlaybackRate`.
+
+**Verification**
+- `npm test`: 149 tests pass across 17 files (incl. the new suite); `npm run typecheck` clean; `tsc -b` in `web/` clean; oxlint shows only pre-existing warnings.
+- Manual check actually executed: built the web bundle, booted the server against a temporary fixture session (60s WAV + SRT, since removed), and drove it via playwright-cli:
+  - All five speeds selectable; `2x` stays `[selected]` when reopening the menu.
+  - Switching mid-playback (t≈38s) applied instantly: `currentTime` advanced ≈2x wall-clock, `paused` stayed `false` - no restart.
+  - `playbackRate` and `defaultPlaybackRate` both confirmed written at 0.75 and 2.
+  - Cue highlight tracked correctly at both rates (`bg-primary/10` on the right cue); timestamp click seeked and resumed playback.
+
+**Closeout**
+- Plan: all DoD items ticked, `status: implemented`, committed in `0699de8`.
+- Event logged via `event.py`, linked to that commit; log committed in `1fb2f3f`.

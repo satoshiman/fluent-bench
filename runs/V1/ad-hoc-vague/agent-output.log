@@ -1,0 +1,16 @@
+I'll explore the workspace to understand the codebase structure first.Sessions already export `.srt`; I'll look at how that's implemented and mirror it for VTT.Now let me check how the UI consumes the SRT, particularly the Review page.Let me check the session manager (for finalize ordering) and the tests, plus the Sessions page UI.The design is clear: `.srt` stays the canonical on-disk artifact (it's spliced live as translations land), and VTT will be generated on demand from it — that's retroactive for all existing sessions and can't go stale. Let me check the remaining test and UI conventions.Now I have the full picture. The `.srt` file is the canonical artifact (translations get spliced in live), so the cleanest design is generating WebVTT on demand from the stored SRT — retroactive for all existing sessions and never stale. Implementing:
+
+1. `server/session/vtt.ts` — SRT→VTT converter
+2. `GET /api/sessions/:id/vtt` route serving `text/vtt` as an attachment
+3. Download button on the Review page
+4. Tests + READMENow the client: API helper and a download button on the Review page.Now the route test in `app.test.ts`, inserted after the lifecycle test:Now let me verify: typecheck and run the relevant tests.All 21 tests pass. Let me run the full suite plus the web checks.Done. All 150 tests pass, typecheck is clean, and oxlint shows only pre-existing warnings.
+
+## What I added
+
+The `.srt` file remains the canonical transcript artifact (translations get spliced into it live), so VTT is generated on demand from it — this works retroactively for every existing session and can never go stale waiting for a late translation.
+
+- `server/session/vtt.ts` — `srtToVtt()`: prepends the `WEBVTT` header, converts `HH:MM:SS,mmm` to `HH:MM:SS.mmm` on timestamp lines, and keeps cue numbers as VTT cue identifiers, speaker prefixes, and translation lines intact.
+- `GET /api/sessions/:id/vtt` in `server/session/routes.ts` — serves `text/vtt` with `Content-Disposition: attachment; filename="<id>.vtt"`, 404 for unknown sessions.
+- `.vtt` download button on the Review page header row (visible when the session has cues), via `sessionsApi.vttUrl()`.
+- Tests: `server/session/vtt.test.ts` for the converter (timestamps, translation lines, commas in text, empty transcript) and a route test in `server/app.test.ts` covering headers, body, and the 404.
+- README bullet documenting the export.

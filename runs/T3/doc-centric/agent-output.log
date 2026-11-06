@@ -1,0 +1,66 @@
+I'll explore the codebase to understand the STT websocket implementation, then draft the plan.Now let me check the remaining context: config, how errors reach the client, test patterns, git setup, and a sample plan for format conventions.Let me check how errors surface to the client and how `app.test.ts` mocks providers.I have the full picture now. Key findings:
+
+- The STT websocket is the **provider-side** socket (Deepgram via `@deepgram/sdk`, AssemblyAI via `ws`), behind the `STTProvider` interface in `server/stt/provider.ts`.
+- On unexpected `onClose`, `SessionManager.openStream` currently calls `finish(active)` and ends the session (`server/session/manager.ts:258-263`).
+- The codebase already composes provider behavior via decorators (`withIdleTimeout`), and both providers accept injectable socket factories (`connectFn`, `wsFactory`) that existing tests use with fake sockets, so no real network is needed.
+- Composition order matters: `withReconnect` must sit *inside* `withIdleTimeout`, otherwise an idle-triggered close would look "unexpected" and resurrect the stream.
+- A reconnect restarts provider timestamps at 0, so `streamBaseS` must be rebased or `[mm:ss]` tags regress. I'll pin an optional `onReconnect` event for that.
+
+Drafting the plan document now:Plan committed. Now logging the planning event per the AGENTS.md workflow (`--no-commit` for non-code work).Done. Drafted and committed `PLAN-012-stt-stream-reconnect` only; the log event is recorded via `event.py` (left uncommitted per your "commit only the plan document" constraint, and it's appended to today's log file).
+
+**Plan summary** (`CONTEXTS/03-implement-plan/PLAN-012-stt-stream-reconnect.md`):
+
+- **Approach:** a new `withReconnect` provider decorator in `server/stt/reconnect.ts`, mirroring the existing `withIdleTimeout` pattern, so both Deepgram and AssemblyAI are covered through the `STTProvider` interface without touching socket internals.
+- **Composition order pinned:** `withIdleTimeout(withReconnect(provider))`. Reconnect must be innermost, otherwise an idle-timeout close would read as an unexpected drop and resurrect the stream, defeating billing hygiene (ADR-002).
+- **Retry policy (literal in plan):** up to 5 attempts per incident, `delay = 1s * 2^(n-1) * random()` full jitter; a `stableMs` (5s) window resets the budget so flapping sockets can't flap forever while long-lived streams get fresh budgets.
+- **Audio:** bounded pending buffer (512 chunks, drop-oldest) filled while `inner` is null, flushed in order on the replacement stream.
+- **Deliberate stops:** outer `close()` sets a flag, cancels the timer, never reconnects; manager's `stopping`/`paused` paths already funnel through it.
+- **Exhaustion:** one `SttReconnectError` (`code: 'STT_RECONNECT_FAILED'`) then `onClose`, which travels the existing `{type:'error'}` broadcast to the client toast and ends the session via the current `finish` path.
+- **Timestamp fix:** new optional `StreamEvents.onReconnect` lets the manager rebase `streamBaseS` so `[mm:ss]` tags don't regress after a reconnect.
+
+**Assumptions recorded in Risks/notes:** decorator layer chosen over manager-side retry; any inner `onError` treated as a drop; buffered burst skews gap timestamps; silent gaps can still hit the 30s idle timeout (accepted per ADR-002); constants injectable but not env-configurable; no frontend changes needed.
+
+Frontmatter is `status: draft, review_count: 0, patch: n/a` — per AGENTS.md it needs at least one verification pass and your approval before implementation.
+I'll start by exploring the CONTEXTS directory structure and finding the newest plan.The newest plan is PLAN-012. Let me read it and the governing records.Now let me read the governing BDRs/ADRs and explore the codebase structure.Now let me read the key files the plan references.Let me check the remaining referenced files: tests, providers, config, and package scripts.Let me check the test harnesses, config, and client-side session code.The codebase matches most claims. Let me verify a few remaining details: tsconfig (Error `cause` support), other plans' frontmatter conventions, and the `app.test.ts` FakeProvider.Let me check the log event for the plan's original request details.I have enough to run the verification. Let me check the git history convention for plan commits first.The convention is clear: `plan:` commits for plan docs, `--no-commit` Docs log events. 
+
+Verification findings so far — the plan is largely accurate against the codebase, but I found several defects in the pinned state machine contract:
+
+1. **Re-entrancy bug**: the plan pins "call `inner.close()` to normalize ... and enter the reconnect flow." But both fake sockets (`FakeDgSocket.close()` and `FakeWs.close()`) emit `'close'` synchronously inside `close()`, re-entering the wrapper's `onClose` before the flow is entered → double-scheduled attempts/leaked timers. Needs an idempotency guard.
+2. **In-flight connect + deliberate close**: `close()` during a pending `connect()` leaves `inner` null; when `start_stream` resolves, a fresh billable socket leaks.
+3. **`openedAt` never initialized** on the first stream.
+4. **"forward onClose once"** needs a `closeForwarded` flag not in the pinned state list.
+5. **Self-editing artifact** left in the text ("no: pin it -").
+6. Missing notes: WAV tee records gap audio (including dropped chunks); AssemblyAI's 10s `OPEN_TIMEOUT_MS` interacts with cumulative fake-time advances in tests.
+
+Now applying the patches to the plan:Now adding the test-plan notes and the WAV-tee risk note.Let me re-read the patched state machine section to verify internal consistency.The patched state machine is internally consistent. Let me run a final check on the full diff, then commit.Diff looks clean. Committing the plan file only, then logging the review event.Verification pass complete on PLAN-012 (`review_count: 0→1`, `patch: n/a→applied`, status stays `draft`). Committed as `a3d9abc`, log event recorded.
+
+## Verified clean against the records
+
+- **ADR-002/ADR-006/BDR-002**: decorator stays behind `STTProvider`, no new deps, bounded retries preserve billing hygiene. Composition-order reasoning confirmed: `withIdleTimeout` emits `IdleTimeoutError` to the outer events and closes its inner (server/stt/idle-timeout.ts:37-38), so reconnect-outermost would indeed resurrect idle-killed streams.
+- **Codebase claims**: `StreamEvents` literal matches provider.ts:16-21; `withIdleTimeout` spreads `...events` so `onReconnect` passes through unedited (idle-timeout.ts:24); the `openStream` base expression to extract exists verbatim (manager.ts:247-253); `ServerEvent` already carries `code?: string` (manager.ts:72); `connectFn`/`wsFactory`/`FakeDgSocket`/`FakeWs`/`providerFactory` all exist as described; `npm test`/`typecheck` gates exist.
+
+## Divergences found and patched
+
+1. **Re-entrancy defect** (would fail the plan's own tests): `inner.close()` re-emits `close` synchronously in both fake sockets, so the pinned "close then enter flow" order double-scheduled attempts. Fixed with a pinned `recovering` flag and flag-then-clear-then-close ordering.
+2. **Billable socket leak**: a `start_stream` resolving after a deliberate `close()` would have been adopted. Now pinned to close-and-drop on late resolve.
+3. **Missing state**: `openedAt` was never initialized on the first stream; "forward `onClose` once" had no flag. Added `closeForwarded` and pinned `openedAt` at initial resolve.
+4. **Leftover self-edit** in the flush semantics cleaned up.
+
+Plus two notes added: WAV tee still records gap audio (including dropped chunks), and fake-socket test caveats (synchronous `close` emission; AssemblyAI's 10s `OPEN_TIMEOUT_MS` vs cumulative fake-time advances).
+
+The plan is now implementable pending your `reviewed`/`approved` status transition.
+The newest plan is PLAN-012. Let me read it.The plan is reviewed (review_count: 1, patch: applied), so the hard gate is cleared. Let me explore the relevant code.Now let me check tsconfig and the config/event script basics.Now the reconnect decorator:Now the manager changes:Now the test file covering every case in the plan's test plan:All 157 tests pass and typecheck is clean. Let me check the dirty log file before committing.All gates pass. Now update the plan: tick every DoD item and set `status: implemented`.Now commit the implementation, then the plan closeout, then log the event.Now log the completion event via event.py:PLAN-012 implemented, committed, and closed out. All DoD items ticked, `status: implemented`, gates green.
+
+**Changes**
+
+- `server/stt/reconnect.ts` (new): `withReconnect` decorator implementing the pinned state machine — unexpected close/error schedules up to 5 retries at `baseDelayMs * 2^(n-1) * random()`, `stableMs` resets the incident budget, bounded drop-oldest pending buffer flushed in order on reconnect, deliberate `close()` cancels retries, exhaustion emits `SttReconnectError` then `onClose` once.
+- `server/stt/provider.ts`: added optional `StreamEvents.onReconnect`.
+- `server/stt/index.ts`: composes `withIdleTimeout(withReconnect(provider))` for both providers (reconnect innermost, so idle closes stay deliberate).
+- `server/session/manager.ts`: extracted `unpausedElapsedS`, rebases `streamBaseS` on `onReconnect`, forwards `code` on error broadcasts.
+- `server/stt/reconnect.test.ts` (new): 10 tests — scripted inner provider (retry timing, exhaustion, buffering, overflow, deliberate close, stableMs reset, rejected reconnects) plus Deepgram/AssemblyAI driven by injected fake sockets.
+
+**Verification:** `npm test` — 157 passed (17 files); `npm run typecheck` clean.
+
+**Commits:** `31386c3` implementation, `7fa9ac5` plan closeout, `5b74db7` log event (linked to `7fa9ac5`).
+
+Note: `git status` still shows pre-existing untracked artifacts (`.start_time`, `agent-output.log`, `transcript-*.json`, `node_modules`) — untouched.

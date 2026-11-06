@@ -1,0 +1,54 @@
+I'll start by exploring the repo structure, the CONTEXTS records, and finding the translation call.Now let me check how the translator is invoked, its tests, and the config/env conventions.Let me check the existing retry constants in the manager and the rest of the assist client's error handling.I have the full picture. The translation call path is:
+
+- `OpenAICompatTranslator.request()` issues one `chat.completions.create` per endpoint with `maxRetries: 0` on the SDK client — a single network blip kills the attempt and jumps straight to fallback.
+- `SessionManager.translateSegment` already has a coarse outer retry (3 attempts, `5s * attempt` backoff), but each attempt burns a fallback hop on any transient error.
+
+I'll draft `PLAN-012` pinning a bounded retry-with-backoff inside `request()`. Writing the plan document now.Now I'll commit the plan document, then log the event per AGENTS.md.The event linked to the plan commit (851b186). Now committing the log entry:Done. Drafted `PLAN-012-translation-request-retry` and committed it (851b186), then logged the event per AGENTS.md (465567d).
+
+Plan summary:
+
+- **Where:** retry loop inside `OpenAICompatTranslator.request()` — applied to both primary and fallback endpoint attempts, before escalation. Primary/fallback ordering and the outer `SessionManager` retry (`3 attempts, 5s*n`) stay unchanged.
+- **Retryable:** `APIConnectionError` family, `APIError` with 408/409/429/5xx, and any non-API/non-`TranslationError` throw (treated as transport noise).
+- **Non-retryable:** other 4xx (401/403/404/422 fail fast to fallback) and `TranslationError` (empty response keeps its current escalate-to-fallback path).
+- **Policy:** injectable `RetryPolicy`, default 3 attempts/endpoint, 250 ms base, 2 s cap, jitter — worst case ~1.1 s added per endpoint.
+- **Rejected alternative:** SDK `maxRetries` — untestable with the fake `ClientFactory`, policy invisible, and it would leak into the assist client.
+
+Frontmatter is `status: draft`, `review_count: 0`, `patch: n/a` — implementation is gated on your review per the hard gate. Assumptions are recorded in Risks/notes (notably: "the translation call" = the LLM request in `request()`, and assist retry is a follow-up).
+I'll start by exploring the workspace structure and finding the newest plan.The newest plan is PLAN-012. Let me read it plus the BDRs and ADRs.Now let me read the governing BDRs/ADRs and the codebase files the plan references.Now let me read the actual code files the plan references.Code matches the plan's description so far. Let me check the SessionManager retry loop, the assist path, the openai SDK version, and test scripts.All SDK error classes exist in openai@7.45.1. Let me check the error class hierarchy and constructor signatures, plus PLAN-009 for the assist claim.SDK typings confirm the classification works (`APIConnectionError extends APIError<undefined>`, `APIError` has `status`). Let me check remaining records (ADR-001/002/004/007, BDR-003..006) and other constructor call sites for completeness.Let me check the remaining SDK error classes to validate the classification completeness.All records and code check out against the plan, except I found real divergences:
+
+1. **Existing tests would break**: `fakeClient`'s `fail` outcome throws a plain `Error`, which the plan's new classification treats as retryable ("neither `APIError` nor `TranslationError`"). The existing tests asserting `calls === ['https://p','https://f']` would get 3 primary calls plus real ~750ms sleeps. The plan doesn't mention updating them.
+2. **Classification order trap**: `APIConnectionError` is an `APIError` subclass with `status: undefined`. If the `APIError` status test runs first, every transport failure lands in the non-retryable branch. The plan doesn't pin check order.
+3. Minor: `APIUserAbortError` also has `status: undefined` (correctly non-retryable); the plan's "aborted requests" under `APIConnectionError` is imprecise, and the risk note about SDK constructors is needlessly vague now that I've verified them.
+
+Patching the plan now.All patches applied. Now committing only the plan file and logging the event.The event linked correctly to the plan commit (0b99cd5). The warning refers to pre-existing untracked files (`.start_time`, `agent-output.log`, `transcript-plan.json`, `node_modules`), which stay uncommitted. Per repo convention, the log update gets its own `log:` commit.Verification pass 1 on PLAN-012 complete. Here's what I found and did:
+
+**Verified clean**
+- All codebase claims accurate: `maxRetries: 0` in `defaultClientFactory`, one `create` per endpoint in `request()`, `MAX_TRANSLATION_ATTEMPTS = 3` / `RETRY_DELAY_MS = 5_000` linear backoff in `SessionManager.translateSegment`, fire-and-forget invocation, `TRANSLATION_FAILED` event
+- `openai@7.45.1` installed; all cited error classes exist with `status` fields as described
+- Governing-record mapping sound against all 6 BDRs and 7 ADRs; no silent violations (ADR-003's single-fallback semantics preserved, no new env vars per ADR-005, no new deps per ADR-006)
+- All four gate scripts exist (`typecheck`, `test`, `web build`, `web lint`)
+
+**Divergences patched**
+1. **Existing tests would break**: `fakeClient`'s `fail` throws a plain `Error`, which the plan's new classification treats as retryable. The two pre-existing tests asserting `['https://p','https://f']` would get 3 primary calls plus ~750ms of real sleeps. Plan now pins `fail` as a non-retryable `APIError(401)` and adds a per-call outcome queue (needed anyway for "succeeds on 2nd try", which the one-outcome-per-URL map can't express).
+2. **Classification order trap**: `APIConnectionError` is an `APIError` subclass with `status: undefined`. Without a pinned check order, transport failures could land in the non-retryable branch. Added a note; also covered `APIUserAbortError` (same `undefined` status, correctly non-retryable).
+3. **Vague risk note replaced**: recorded the verified `openai@7.45.1` constructor signatures instead of deferring the check to the implementer.
+
+Plus a new DoD item keeping the pre-existing test expectations verifiable.
+
+**Frontmatter**: `review_count: 0 → 1`, `patch: n/a → applied`. Status stays `draft` (only you move it to reviewed/approved). No implementation started.
+
+**Commits**: `0b99cd5` (plan only), `bc17e9e` (log event). Working tree otherwise untouched.
+I'll start by finding the newest plan and understanding the workspace state.The newest plan is PLAN-012. Let me read it along with its governing records.Let me verify the openai SDK error class signatures the plan pins.The plan gates pass (`review_count: 1`, `patch: applied`). Let me check `translator.ts` and confirm the SDK's error exports.SDK signatures confirmed. Now implementing Step 1 in `openai-compat.ts`.Step 2: updating the test file with the new fake and retry cases.Now add the new retry test cases and the classification suite.Now running the DoD gates: typecheck and tests first.All 154 tests pass. Now the web build and lint gates.All gates clean. Now ticking the DoD and marking the plan `implemented`.The event linked to HEAD (7be134e) correctly — the untracked files are pre-existing bench artifacts, not part of the change. Committing the log entry per repo convention (`log:` commits in history).PLAN-012 implemented and closed out. Summary:
+
+**Implementation** (`server/translate/openai-compat.ts`)
+- Added `RetryPolicy`, `DEFAULT_RETRY_POLICY` (3 attempts, 250ms base, 2s cap), and `isRetryableTranslationError` with the pinned classification: `APIConnectionError` first (it's an `APIError` subclass with `status: undefined`), then retryable statuses 408/409/429/5xx, then `TranslationError` non-retryable, unknown errors assumed transient.
+- `request()` wraps `chat.completions.create` in a retry loop with exponential backoff (`base * 2^(n-1)`, capped) and 50-100% jitter. Non-retryable errors and exhaustion rethrow into the existing primary/fallback escalation, which is unchanged.
+- 4th constructor param `retryPolicy = DEFAULT_RETRY_POLICY`; `makeTranslator` signature untouched. Worst-case added latency ~1.1s per endpoint.
+
+**Tests** (`server/translate/openai-compat.test.ts`)
+- `fakeClient` now supports per-call outcome queues and arbitrary `Error`/`{content}` outcomes; `'fail'` throws a non-retryable `APIError(401)` so pre-existing `['https://p','https://f']` expectations hold.
+- New cases: 2nd-try success after `APIConnectionError`, exhaustion-to-fallback (`['https://p' x3, 'https://f']`), fast-fail 401, 500/429 retry, `TypeError` retry, no-retry on empty response, plus a direct `isRetryableTranslationError` classification suite. All use a zero-delay injected policy.
+
+**Gates**: `tsc --noEmit` clean, 154/154 vitest pass, web build and lint clean.
+
+**Records**: all 6 DoD items ticked, `status: implemented` in frontmatter and body. Committed as `7be134e`, event logged via `event.py` (bound to that HEAD), log committed as `791f1d5`.

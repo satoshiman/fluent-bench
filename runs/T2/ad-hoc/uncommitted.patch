@@ -1,0 +1,286 @@
+diff --git a/server/translate/openai-compat.test.ts b/server/translate/openai-compat.test.ts
+index 5dd0549..ee29e44 100644
+--- a/server/translate/openai-compat.test.ts
++++ b/server/translate/openai-compat.test.ts
+@@ -134,6 +134,157 @@ describe('OpenAICompatTranslator', () => {
+       TranslationError,
+     );
+   });
++
++  describe('retries', () => {
++    const noDelay = { sleep: async () => {}, random: () => 0 };
++
++    const httpError = (status: number) =>
++      Object.assign(new Error(`HTTP ${status}`), { status });
++
++    // Each create() call consumes the next step: 'ok' returns a completion,
++    // anything else is thrown. Steps beyond the list repeat the last one.
++    function scripted(steps: Array<'ok' | Error>) {
++      const calls: string[] = [];
++      let i = 0;
++      const factory = (ep: LLMEndpoint) =>
++        ({
++          chat: {
++            completions: {
++              create: async () => {
++                calls.push(ep.baseURL);
++                const step = steps[Math.min(i, steps.length - 1)];
++                i += 1;
++                if (step === 'ok' || step === undefined) {
++                  return {
++                    choices: [{ message: { content: 'translated' } }],
++                  };
++                }
++                throw step;
++              },
++            },
++          },
++        }) as unknown as Pick<OpenAI, 'chat'>;
++      return { calls, factory };
++    }
++
++    it('retries on a 5xx then succeeds', async () => {
++      const { calls, factory } = scripted([httpError(503), 'ok']);
++      const t = new OpenAICompatTranslator(
++        endpoint('https://p'),
++        undefined,
++        factory,
++        noDelay,
++      );
++      const out = await t.translate(segment, [], 'vi');
++      expect(out).toBe('translated');
++      expect(calls).toEqual(['https://p', 'https://p']);
++    });
++
++    it('fails immediately on a non-retryable 4xx', async () => {
++      const { calls, factory } = scripted([httpError(400), 'ok']);
++      const t = new OpenAICompatTranslator(
++        endpoint('https://p'),
++        undefined,
++        factory,
++        noDelay,
++      );
++      await expect(t.translate(segment, [], 'vi')).rejects.toBeInstanceOf(
++        TranslationError,
++      );
++      expect(calls).toEqual(['https://p']);
++    });
++
++    it('stops after 3 attempts and surfaces the failure', async () => {
++      const delays: number[] = [];
++      const { calls, factory } = scripted([
++        httpError(500),
++        httpError(500),
++        httpError(500),
++        'ok',
++      ]);
++      const t = new OpenAICompatTranslator(
++        endpoint('https://p'),
++        undefined,
++        factory,
++        { sleep: async (ms) => { delays.push(ms); }, random: () => 0 },
++      );
++      await expect(t.translate(segment, [], 'vi')).rejects.toBeInstanceOf(
++        TranslationError,
++      );
++      expect(calls).toEqual(['https://p', 'https://p', 'https://p']);
++      expect(delays).toEqual([500, 1000]);
++    });
++
++    it('retries on 429 and network errors', async () => {
++      const connErr = Object.assign(new Error('socket hang up'), {
++        code: 'ECONNRESET',
++      });
++      const { calls, factory } = scripted([httpError(429), connErr, 'ok']);
++      const t = new OpenAICompatTranslator(
++        endpoint('https://p'),
++        undefined,
++        factory,
++        noDelay,
++      );
++      const out = await t.translate(segment, [], 'vi');
++      expect(out).toBe('translated');
++      expect(calls).toEqual(['https://p', 'https://p', 'https://p']);
++    });
++
++    it('does not retry a malformed (empty) response', async () => {
++      let n = 0;
++      const factory = (ep: LLMEndpoint) =>
++        ({
++          chat: {
++            completions: {
++              create: async () => {
++                n += 1;
++                return {
++                  choices:
++                    n === 1
++                      ? [{ message: { content: '  ' } }]
++                      : [{ message: { content: 'translated' } }],
++                };
++              },
++            },
++          },
++        }) as unknown as Pick<OpenAI, 'chat'>;
++      const t = new OpenAICompatTranslator(
++        endpoint('https://p'),
++        undefined,
++        factory,
++        noDelay,
++      );
++      await expect(t.translate(segment, [], 'vi')).rejects.toBeInstanceOf(
++        TranslationError,
++      );
++      expect(n).toBe(1);
++    });
++
++    it('moves to the fallback after the primary exhausts retries', async () => {
++      const { calls, factory } = scripted([httpError(500)]);
++      const t = new OpenAICompatTranslator(
++        endpoint('https://p'),
++        endpoint('https://f'),
++        (ep) =>
++          ep.baseURL === 'https://f'
++            ? ({
++                chat: {
++                  completions: {
++                    create: async () => ({
++                      choices: [{ message: { content: 'fallback ok' } }],
++                    }),
++                  },
++                },
++              } as unknown as Pick<OpenAI, 'chat'>)
++            : factory(ep),
++        noDelay,
++      );
++      const out = await t.translate(segment, [], 'vi');
++      expect(out).toBe('fallback ok');
++      expect(calls).toEqual(['https://p', 'https://p', 'https://p']);
++    });
++  });
+ });
+ 
+ describe('renderPrompt', () => {
+diff --git a/server/translate/openai-compat.ts b/server/translate/openai-compat.ts
+index 3b05342..ee7c3e4 100644
+--- a/server/translate/openai-compat.ts
++++ b/server/translate/openai-compat.ts
+@@ -1,5 +1,10 @@
+ import OpenAI from 'openai';
+ import type { Config } from '../config.js';
++import {
++  isRetryableError,
++  withRetry,
++  type RetryOptions,
++} from './retry.js';
+ import {
+   TranslationError,
+   type Translatable,
+@@ -34,6 +39,7 @@ export class OpenAICompatTranslator implements Translator {
+     private readonly primary: LLMEndpoint,
+     private readonly fallback: LLMEndpoint | undefined,
+     private readonly clientFactory: ClientFactory = defaultClientFactory,
++    private readonly retryOptions: RetryOptions = {},
+   ) {}
+ 
+   async translate(
+@@ -84,8 +90,10 @@ export class OpenAICompatTranslator implements Translator {
+       temperature: 0.2,
+       ...endpoint.extraBody,
+     };
+-    const res = (await client.chat.completions.create(
+-      body as never,
++    const res = (await withRetry(
++      () => client.chat.completions.create(body as never),
++      isRetryableError,
++      this.retryOptions,
+     )) as OpenAI.ChatCompletion;
+     const text = res.choices[0]?.message?.content?.trim();
+     const cleaned = text ? stripSpeakerLabel(text, segment.speaker) : '';
+diff --git a/server/translate/retry.ts b/server/translate/retry.ts
+new file mode 100644
+index 0000000..4d8d1da
+--- /dev/null
++++ b/server/translate/retry.ts
+@@ -0,0 +1,82 @@
++// Transient failures only: HTTP 5xx, HTTP 429, and connection-level
++// network errors. The OpenAI SDK reports HTTP failures via `status` and
++// wraps transport failures in APIConnectionError (no status). Node's
++// undici fetch surfaces transport failures as TypeError whose `cause`
++// carries an errno code, so the cause chain is walked too. Everything
++// else - other 4xx, malformed responses, programming errors - is not
++// retried.
++export function isRetryableError(err: unknown): boolean {
++  let e: unknown = err;
++  while (e != null) {
++    const status = (e as { status?: unknown }).status;
++    if (typeof status === 'number') {
++      return status === 429 || status >= 500;
++    }
++    const name = (e as { name?: unknown }).name;
++    if (
++      name === 'APIConnectionError' ||
++      name === 'APIConnectionTimeoutError'
++    ) {
++      return true;
++    }
++    const code = (e as { code?: unknown }).code;
++    if (typeof code === 'string' && RETRYABLE_CODES.has(code)) {
++      return true;
++    }
++    e = (e as { cause?: unknown }).cause;
++  }
++  return false;
++}
++
++const RETRYABLE_CODES = new Set([
++  'ECONNABORTED',
++  'ECONNREFUSED',
++  'ECONNRESET',
++  'EHOSTUNREACH',
++  'ENETUNREACH',
++  'ENOTFOUND',
++  'EAI_AGAIN',
++  'EPIPE',
++  'ETIMEDOUT',
++  'UND_ERR_BODY_TIMEOUT',
++  'UND_ERR_CONNECT_TIMEOUT',
++  'UND_ERR_HEADERS_TIMEOUT',
++  'UND_ERR_SOCKET',
++]);
++
++export interface RetryOptions {
++  maxAttempts?: number;
++  baseDelayMs?: number;
++  sleep?: (ms: number) => Promise<void>;
++  random?: () => number;
++}
++
++const DEFAULT_MAX_ATTEMPTS = 3;
++const DEFAULT_BASE_DELAY_MS = 500;
++const JITTER_FRACTION = 0.25;
++
++const defaultSleep = (ms: number) =>
++  new Promise<void>((resolve) => setTimeout(resolve, ms));
++
++// Exponential backoff: baseDelayMs, doubling per attempt, plus up to 25%
++// random jitter to avoid thundering herd. The last error is rethrown so
++// exhaustion surfaces through the caller's normal error path.
++export async function withRetry<T>(
++  fn: () => Promise<T>,
++  shouldRetry: (err: unknown) => boolean,
++  opts: RetryOptions = {},
++): Promise<T> {
++  const maxAttempts = opts.maxAttempts ?? DEFAULT_MAX_ATTEMPTS;
++  const baseDelayMs = opts.baseDelayMs ?? DEFAULT_BASE_DELAY_MS;
++  const sleep = opts.sleep ?? defaultSleep;
++  const random = opts.random ?? Math.random;
++  for (let attempt = 1; ; attempt++) {
++    try {
++      return await fn();
++    } catch (err) {
++      if (attempt >= maxAttempts || !shouldRetry(err)) throw err;
++      const backoff = baseDelayMs * 2 ** (attempt - 1);
++      await sleep(backoff * (1 + random() * JITTER_FRACTION));
++    }
++  }
++}

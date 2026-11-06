@@ -1,0 +1,7 @@
+The list endpoint doesn't take a query param, so I'll add a client-side search box in the card header (the card supports a `CardAction` slot) that filters by id, languages, STT provider, model, and speaker names.Now let me verify with typecheck and lint:Done. Added a search box to the Sessions page in `web/src/pages/Sessions.tsx`:
+
+- Search input with a `Search` icon in the card header via the `CardAction` slot
+- Client-side filtering (the `/api/sessions` endpoint has no query param) across session id, source/target languages, STT provider, model, and speaker names
+- Shows a "No sessions match ..." row when the filter has no hits
+
+Typecheck, `oxlint`, and `vite build` all pass.

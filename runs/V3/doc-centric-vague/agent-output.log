@@ -1,0 +1,50 @@
+I'll explore the workspace structure and find the sessions page.I have the full picture. Now I'll write the plan draft as `PLAN-012-sessions-search-box.md`.Plan committed. Now logging the planning event per AGENTS.md (non-code work logs with `--no-commit`).Done. Drafted `CONTEXTS/03-implement-plan/PLAN-012-sessions-search-box.md` and committed only that file (`96ad505`). Also logged a `--no-commit` planning event per AGENTS.md.
+
+Key decisions pinned in the plan:
+
+- **Client-side filter only**: `GET /api/sessions` already returns every `SessionSummary`; at personal volume (BDR-001/002) a browser filter over the loaded list is enough. No API changes, no new deps.
+- **New helper** `web/src/lib/session-search.ts` (`sessionMatches` / `filterSessions`) so the logic is unit-testable with vitest.
+- **Searchable fields**: id/slug, file path, `started_at` ISO, both langs, `stt_provider`, `model`, speaker display names. Case-insensitive substring.
+- **UI**: existing shadcn `Input` in the `CardHeader` with `Search` icon, clear-`X` button, and a `colSpan=7` "No sessions match" row; zero-session `Empty` state untouched.
+
+Assumptions recorded under Risks/notes: the request is interpreted as metadata filtering, not full transcript-content search (ADR-004 designates a SQLite index for that, a separate decision); the localized date format isn't searchable; the query isn't persisted across navigation.
+
+Frontmatter is `status: draft`, `review_count: 0`, `patch: n/a`, so the hard gate applies: it needs at least one verification pass and your `reviewed`/`approved` status before implementation.
+The newest plan is PLAN-012. Now I'll read the governing BDRs/ADRs it cites and the codebase files it touches.Now let me verify the codebase claims: `SessionSummary` type shape, `lib/` location, `input.tsx` existence, existing tests, and lint/build gates.Plan and governing records read. Now verifying code-level claims: type nullability, `file` field content, `@/` alias resolution, test runner config, and icon availability.`rg` isn't on PATH here; using the grep tool for the remaining checks.`file` is an absolute path, not relative, and `sessions` state is `SessionSummary[] | null` — two things to verify against the plan's pinned contract. Checking the shadcn primitives the plan reuses.All checks complete. Verification found four real divergences between the pinned plan and the codebase:
+
+1. **`s.file` is absolute, not relative.** `listSessions` passes `path.join(sessions.dir, day, file)` where `sessions.dir` = `path.resolve(process.cwd(), 'sessions')` (store.ts:86-93, manager.ts:120).
+2. **`sessions` is `SessionSummary[] | null`.** The pinned `useMemo(() => filterSessions(sessions, query), ...)` runs before the `sessions === null` early return (hooks are unconditional) and would throw on `null` at runtime.
+3. **`CardAction` already exists** and is the established pattern for a header-right control (Live.tsx:456); `CardHeader` is a `grid` that auto-switches to `grid-cols-[1fr_auto]` for it. The plan's `flex` override works but bypasses the convention.
+4. **`s.started_at` is `string | null`** and `s.id` examples are wrong: real ids are `YYYY-MM-DD-<slug>-<HHmm>` (`sessionIdFor`, markdown.ts:33-37).
+
+Patching the plan now.All patches applied and frontmatter updated. Committing only the plan file (the pre-existing `CONTEXTS/04-logs` modification is untouched).Verification pass 1 on PLAN-012 complete, committed as `5bc78c5`.
+
+## Findings and patches applied
+
+**Divergences found (patched):**
+
+1. **`sessions ?? []` null guard** — the pinned `useMemo(() => filterSessions(sessions, query), ...)` would throw at runtime: `sessions` is `SessionSummary[] | null` and the memo runs before the `sessions === null` early return since hooks are unconditional.
+2. **`CardAction` replaces the flex-header pin** — `CardHeader` is a `grid` that auto-applies `grid-cols-[1fr_auto]` when the `card-action` slot is present, and `Live.tsx` already uses `CardAction` for a header-right control. The plan now follows that convention instead of overriding `grid` with `flex`.
+3. **`s.file` described accurately** — it's the absolute `.md` path (`listSessions` joins `sessions.dir`), not a relative path; still contains the `sessions/<YYYY-MM-DD>/` segment so date fragments match. A risk note was added for machine-specific leading segments.
+4. **`s.started_at` null-safety + `s.id` example fixed** — `started_at` is `string | null` (now marked null-safe), and real ids are `YYYY-MM-DD-<slug>-<HHmm>`, not `standup-1430`.
+5. **Gate precision** — noted that root `npm run typecheck` excludes `web/`; `tsc -b` inside `npm --prefix web run build` is the actual web typecheck.
+
+**Flagged, out of scope:** `web/tsconfig.app.json` doesn't enable `strict` despite ADR-006's "strict everywhere" claim — pre-existing drift, recorded as a risk note; enabling it would be a separate task.
+
+**Verified clean:** `SessionSummary` field list, `input.tsx`/`CardAction`/`Button size="icon"` existence, `Search`/`X` in lucide-react, `@` alias in vitest config, `colSpan=7` matching the 7-column table, test file location matching `web/src/**/*.test.{ts,tsx}` include, and no conflicts with any BDR or ADR.
+
+Frontmatter: `review_count: 0 → 1`, `patch: n/a → applied`. Status stays `draft` (developer moves it to `reviewed`/`approved`).
+I'll start by finding the newest plan and reviewing the workspace structure.The plan is reviewed (`review_count: 1`, `patch: applied`), so the hard gate passes. Now let me examine the codebase files the plan touches.Let me check the `CardAction` component, `Input`, and the existing `CardAction` usage pattern in `Live.tsx`.I have the full picture. Let me check the `Button` component's `size` variants and the tsconfig for the web app, then set up the task list.All context gathered. The plan passes the hard gate (`review_count: 1`, `patch: applied`). Setting up tasks and implementing.Now updating `Sessions.tsx` with the imports, state, memo, and the CardAction search control.Now the vitest suite.Running the gates now: root typecheck, vitest, web build, and web lint.Typecheck and all 158 tests pass. Now the web build and lint.All automated gates pass (lint shows only pre-existing warnings in other files). For the "manual acceptance" DoD item, let me try a quick smoke check with the dev server. First, how does the app run?Sessions live in `<cwd>/sessions/<YYYY-MM-DD>/<id>.md`. Let me check the frontmatter format so I can create fixture sessions for the browser smoke test.The frontmatter format is clear. I'll create two fixture sessions, boot the server with dummy env keys, and smoke-test the page.The API serves both fixture sessions. The built `web/dist` includes my changes, so let me verify in a real browser using the playwright-cli skill.Page renders with the search box and both session rows. Now testing live filtering.Filtering works — "standup" narrowed to one row and the clear button appeared. Now testing the no-match state and clearing.No-match state verified. Now testing the clear button and a speaker-name search.Clear button restores all rows. Testing speaker-name search ("Alice"), then the zero-session empty state.All manual acceptance items verified. Cleaning up the test server and browser, then closing out the plan.Plan closed out. Now checking git state and committing.That's a leftover uncommitted event from the earlier plan-drafting session. I'll commit it separately first, then the implementation.Now logging the event via `event.py`, bound to the implementation commit.The event is bound to the implementation commit. Committing the log update to keep the tree clean.PLAN-012 implemented and closed out. Summary:
+
+**Changes**
+- `web/src/lib/session-search.ts` (new): `sessionMatches` / `filterSessions` with the pinned semantics - trimmed, lowercased substring match over id, file path, `started_at`, languages, STT provider, model, and speaker display names.
+- `web/src/pages/Sessions.tsx`: `query` state + `useMemo` filtered rows, search `Input` with `Search`/`X` icons in the `CardAction` slot, `colSpan=7` no-match row. Zero-session empty state untouched.
+- `web/src/lib/session-search.test.ts` (new): 13 vitest cases covering every item in the plan's test plan.
+
+**Verification**
+- `npm run typecheck` clean, `npm test` 158/158 pass, `npm --prefix web run build` clean, `oxlint` only pre-existing warnings.
+- Browser-verified all manual acceptance items via playwright-cli against a live server with fixture sessions: slug-fragment filtering narrows rows, X button restores them, `No sessions match "zzz"` renders with all 7 headers, zero sessions shows "No sessions yet" with no search box, and a speaker-name search ("Alice") matches. Fixture sessions were deleted after testing (`sessions/` is gitignored anyway).
+
+**Records**
+- PLAN-012: all DoD items ticked, `status: implemented`.
+- Commits: `90e63b8` (implementation + plan closeout), plus `9e40349`/`69ff8d8` for the log events. Completion event logged via `event.py`, bound to `90e63b8`.

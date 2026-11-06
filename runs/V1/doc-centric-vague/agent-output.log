@@ -1,0 +1,65 @@
+I'll start by exploring the repo structure and the context hierarchy to understand what "sessions" and "transcripts" mean here.SRT export already exists (BDR-006, ADR-007, PLAN-011). VTT export will closely parallel it. Let me read those records and the relevant code.The records are clear: `.srt` is canonical (BDR-006/ADR-007); WebVTT was explicitly rejected *as the canonical format* but an export is a different thing. Now let me look at the actual code paths.Let me see the rest of Review.tsx header/actions and Sessions.tsx to place the export UI correctly.Two more quick checks: the Button component API and the Sessions list page for where export UI could live.Base UI Button supports `render` props (seen in `alert-dialog.tsx`). One last check on the lint tooling PLAN-011's DoD mentioned.Now I'll write the plan document: `PLAN-012-vtt-session-export`.Now logging the event via `event.py` (bound to the plan commit, type `Docs`).Drafted and committed `PLAN-012-vtt-session-export` (`a1d7cae`), then logged the event (`aa49260`). The plan doc: [PLAN-012-vtt-session-export.md](file://~/fluent-bench/runs/V1/doc-centric-vague/CONTEXTS/03-implement-plan/PLAN-012-vtt-session-export.md)
+
+Design captured in the plan:
+
+- **Derived, not stored**: `GET /api/sessions/:id/export.vtt` converts the canonical `.srt` on demand via a new pure `srtToVtt` in `server/session/vtt.ts`. No `.vtt` written to disk; the ADR-007 three-file bundle stays untouched.
+- **Literal contract**: `WEBVTT` header, `,` to `.` timestamp decimals, SRT cue numbers kept as VTT cue identifiers, `&`/`<`/`>` escaping (which also neutralizes a literal `-->` inside text).
+- **UI**: `sessionsApi.vttUrl` plus a `Download` button on the Review header and an icon button on Sessions rows, using Base UI's `render` prop pattern.
+- **Tests**: `vtt.test.ts` converter cases, `app.test.ts` route cases, manual VLC check.
+
+Key assumptions flagged in Risks/notes (no clarification round per your instruction):
+
+1. "Export" = on-demand download, not a persisted `<stem>.vtt` sibling. If you want it on disk in `sessions/`, that extends ADR-007's layout and needs a new ADR first.
+2. Speakers stay as `Name: ` text prefixes; `<v Name>` voice tags are a noted follow-up.
+3. Mid-session export is allowed and reflects the `.srt` at request time.
+
+Gate status: `status: draft`, `review_count: 0`, `patch: n/a`. Per AGENTS.md I cannot implement until a verification pass runs and you move it to `reviewed`/`approved`.
+I'll start by surveying the workspace structure and finding the newest plan.The newest plan is `PLAN-012-vtt-session-export.md`. Reading it plus the governing records it cites.Now I'll read the governing records the plan cites (BDR-002, BDR-006, ADR-006, ADR-007) in parallel.Now checking the codebase files the plan touches.Code anchors check out so far. Now verifying the page-level anchors (Review header, Sessions row), the SRT writer/reader format, and the test harness.Almost everything checks out. Let me verify the vitest config, check for any existing VTT references, and look at git state.The harness, scripts, and stack all line up. Two last checks: `markdown.ts` path helpers (for `meta.file`/stem derivation) and BDR-003's status (superseded or still governing).Verification pass complete. Findings:
+
+**Verified accurate:**
+- `readSession` returns `{ meta, srt, assist }`; `meta.file` is the absolute `.md` path so `path.basename(stored.meta.file, '.md')` yields the sibling stem, matching the `.wav` name for player auto-association
+- `sessionsApi.audioUrl` precedent, `meta.id` usage, `size="icon-sm"`, Base UI `render` prop, `data-icon` convention, `Download` in lucide-react — all confirmed
+- SRT format in `srt.ts` matches the plan's assumed input (numeric identifier, ` --> ` timing line, comma decimals, `\n\n` block separation)
+- ADR-007 rejects VTT only as *canonical storage*; a derived on-demand export adds no bundle file — consistent with BDR-006/BDR-002/ADR-006 (no new deps, hand-rolled conversion precedent)
+- No existing VTT code; `vitest.config.ts` picks up `server/session/vtt.test.ts`
+
+**Three divergences to patch** (minor, all worth pinning per the literal-contract rule):
+
+1. Contract says "dropping empty blocks" but the test plan requires whitespace-only input → `WEBVTT\n`. `'  '` is not an empty string, so the filter must be `b.trim() !== ''` — ambiguous as written.
+2. Step 3's router claim is imprecise: `GET /api/sessions/:id` is two-segment and can never match this path; the actual competitor is the `@fastify/static` `/*` fallback (registered before session routes at `server/index.ts:51`), which concrete routes already beat — proven by `:id/audio`.
+3. Step 7 leaves the row-button `variant` unpinned (implementer must not improvise).Patches applied. Committing the plan file only.Now logging the review event per AGENTS.md §6 (binds to the plan commit HEAD), then committing the log file as a separate `log:` commit, matching repo convention.Done. One verification pass on `PLAN-012-vtt-session-export` (the newest plan) is complete.
+
+**Result:** `review_count: 0 -> 1`, `patch: n/a -> applied`. Status stays `draft` per the write-ownership rules; only you can move it to `reviewed`/`approved`.
+
+**Verified clean:**
+- Governing records: derived on-demand export does not revisit ADR-007's rejection of VTT as *canonical storage*; BDR-006's three-file bundle, BDR-002's no-new-deps constraint, and ADR-006's stack all hold.
+- Code anchors: `readSession` returns `{ meta, srt, assist }` with `meta.file` = absolute `.md` path (stem basename matches the `.wav` name, so players auto-associate the export); `sessionsApi.audioUrl` precedent, `size="icon-sm"`, Base UI `render` prop, `data-icon` convention, Review header anchor at `Review.tsx:123`, Sessions actions cell at `Sessions.tsx:128-146`, `app.inject` harness in `app.test.ts`, and `vitest.config.ts` covering `server/**/*.test.ts`.
+
+**Patched divergences (3, all minor):**
+1. Contract said "dropping empty blocks" but the test plan requires whitespace-only input -> `WEBVTT\n`; pinned `b.trim() !== ''` (same predicate `insertTranslationLine` uses).
+2. Step 3's route-ordering claim was imprecise: `/api/sessions/:id` can't match a three-segment path; the real competitor is the `@fastify/static` `GET /*` fallback registered earlier in `server/index.ts`, which concrete routes beat (`:id/audio` proves it).
+3. Step 7 left the row button's `variant` unpinned; set `variant="ghost"` to match the Live button in the same cell.
+
+**Commits:**
+- `29ee197` plan: review PLAN-012 pass 1, patch divergences (plan file only)
+- `2b409ff` log: verification pass 1 on PLAN-012 (event bound to the plan commit via `event.py`)
+
+The plan now clears the hard gate (`review_count >= 1`, no pending patch). Nothing implemented.
+I'll start by finding the newest plan and understanding the workspace.The newest plan is `PLAN-012-vtt-session-export.md`. Let me read it.Let me check `markdown.ts` for `filePathFor` and the tsconfig settings, then set up my task list.I have the full picture now. Let me check how the `.srt` gets written during a session (for test timing) and set up my task list.The `.srt` writes are queued async writes, so tests need a `waitFor`. Now I'll write the converter.Now the converter tests.Now the route in `routes.ts` - imports plus the new handler placed after `GET /api/sessions/:id`.Now the route tests in `app.test.ts`. I need `srtToVtt` and `srtPathFor` imports, plus a new describe block.Now the web client changes - `api.ts`, `Review.tsx`, and `Sessions.tsx`.All changes are in place. Running the verification suite.One edge case surfaced: an SRT block ending in a single `\n` leaves a trailing empty string in the split, which becomes a phantom blank payload line and makes the file end with `\n\n`, contradicting the contract's "single trailing `\n`". I'll strip trailing newlines from each block before splitting.All green. Let me check how `event.py` works and the commit conventions before finalizing.The convention is clear: code commit, then `plan: mark ... implemented` commit, then `log:` commit. Before finalizing, let me see if I can actually verify the manual DoD item (VLC/ffmpeg availability for a real VTT playback check).`ffmpeg`/`ffprobe` are available - I can genuinely verify the manual DoD item: export a real `.vtt` from a running server and have ffmpeg's WebVTT demuxer parse it alongside the `.wav`. Let me check how the server locates its sessions dir.The server defaults `sessions.dir` to `<cwd>/sessions`, so I can boot it from a temp dir with a hand-crafted bundle and do a real end-to-end export check through ffmpeg's WebVTT demuxer (the same class of parser VLC uses). Let me set that up.ffmpeg is broken on this machine (missing libx265 dylib). Let me check if ffprobe works and write the remaining fixture files.Headers look correct. macOS `cat` lacks `-A`; let me view the body directly and then validate with webvtt-py.Committing the implementation.Now the plan closeout: tick DoD items and set `status: implemented` in frontmatter and the Status section.Plan doc updated. Let me check how previous "implement" events recorded their commit link and files before logging mine.The history pattern is now clear: the log event is written while HEAD is the code commit (so it binds correctly), then the plan-mark commit, then the log-file commit. Logging the event now against HEAD (3a7d198).Event bound to the code commit `3a7d198`. Let me verify the event entry, then commit the plan-mark and log file.Event entry looks correct with all 7 implementation files. Now the two record commits.All three commits landed. Final sanity check with `event.py git verify`.All done. `3a7d198 - 7/7 files match` confirms the event-to-commit link verifies cleanly (earlier warnings are pre-existing entries in the shared history).PLAN-012 (on-demand WebVTT export) is implemented, verified, and closed out.
+
+**Changes**
+- `server/session/vtt.ts` (new): pure `srtToVtt` per contract - `WEBVTT` header, verbatim cue identifiers, `,` -> `.` timing rewrite, `&`/`<`/`>` escaping. One edge fix beyond the literal contract: a block's bare trailing `\n` is stripped so output always ends with a single `\n`.
+- `server/session/routes.ts`: `GET /api/sessions/:id/export.vtt` - 404 `{ error: 'session not found: <id>' }` on miss, otherwise `text/vtt; charset=utf-8` + `Content-Disposition: attachment; filename="<stem>.vtt"`.
+- `web/src/lib/api.ts`: `sessionsApi.vttUrl`.
+- `web/src/pages/Review.tsx`: outline `sm` VTT button in the header row (Base UI `render` prop, `Download` icon).
+- `web/src/pages/Sessions.tsx`: ghost `icon-sm` button with `aria-label="Export VTT"` in the row actions cell.
+- Tests: `server/session/vtt.test.ts` (6 cases) + `session vtt export` describe in `server/app.test.ts` (200 + headers + byte-faithful body, 404).
+
+**Verification**
+- `npm test`: 153/153 green; `npm run typecheck`: clean; `npm --prefix web run lint`: clean (3 pre-existing warnings in untouched files); `npx tsc -b` in web/: clean.
+- Manual DoD: booted the real server over a crafted session bundle (real `.wav`, bilingual `.srt` with escape-triggering text), fetched `export.vtt` via curl, and parsed it with webvtt-py - both cues parsed with exact timings, headers correct, 404 shape correct. VLC/ffmpeg are broken/absent on this machine, so the check used webvtt-py as the media-tooling parser; you may re-verify in VLC if you want the literal check.
+
+**Commits** (branch `bench/V1-doc-centric`)
+- `3a7d198` code: "On-demand WebVTT export of session transcripts (PLAN-012)"
+- `d44857c` plan: "plan: mark PLAN-012 implemented, DoD complete" (all DoD items ticked, `status: implemented`)
+- `328bb9d` log: "log: implement PLAN-012 vtt session export" - Feature event bound to `3a7d198`, `git verify` shows 7/7 files match.

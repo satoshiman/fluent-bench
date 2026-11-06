@@ -1,0 +1,61 @@
+I'll start by exploring the repository structure and the relevant transcript code.Now let me check the session routes and any export/render paths (the task mentions "markdown and subtitle export").The transcript lives in the `.srt` sibling; the `.md` holds frontmatter + Assist body. Let me check the governing records (ADR-007, PLAN-011, ADR-005) and the app-level test to pin down where merge should hook in.Let me check the remaining surfaces: the web live-session reducer (index semantics), Sessions page for any export path, and the app-level test.Let me check how `app.test.ts` builds the `Config` for `SessionManager`, and look at `config.test.ts` conventions.Let me quickly check the remaining governing records to reference them accurately in the plan.One thing to check before drafting: whether existing `app.test.ts` emits multiple same-speaker finals (which would merge under a default-on config and break current assertions).I have the full picture now. Key design finding: the transcript persists only in the `.srt` (ADR-007); the `.md` holds frontmatter + `## Assist`. Cue number = `index + 1` permanently binds cues to socket-event indices, and translations splice in asynchronously by that index — so the cleanest seam is inside `SessionWriter`: socket events, indices, assist tags, and the web display stay byte-identical while only the stored `.srt` is merged.
+
+Drafting `PLAN-012` now.Now committing only the plan document, per repo conventions.Logging the planning event per AGENTS.md section 6.The event linked correctly to the plan commit. Committing the log file per repo convention (paired `log:` commits in history).Plan drafted and committed. Summary:
+
+**PLAN-012** at `CONTEXTS/03-implement-plan/PLAN-012-merge-short-segments.md` (`status: draft`, `review_count: 0`, `patch: n/a`) — committed as `779e429`, with the event logged and the log committed as `74249bc` per repo convention.
+
+Key design decisions recorded in the plan:
+
+- **Merge point: `SessionWriter`, not the manager.** The transcript persists only in the `.srt` (ADR-007 — the `.md` holds frontmatter + `## Assist`, no transcript lines). Merging in the writer keeps socket events, segment indices, assist `#n` tags, and the web display byte-identical; only the stored subtitle file changes.
+- **Config:** `TRANSCRIPT_MERGE_MAX_S` env var (zod, nonnegative, default `10`; `0` disables), documented in `.env.example` — per ADR-005.
+- **Rule:** merge when `seg.speaker === lastCue.speaker` and `seg.end_s - lastCue.start_s < mergeMaxS`; merged text joins with a space via a new `extendCue` helper (same read → splice → tmp+rename pattern as `appendTranslation`).
+- **Cue binding preserved:** merged-away indices leave numbering gaps so `index + 1` keeps binding existing cues to socket indices.
+- **Translations:** writer maps segment index → cue number; merged cues collect all contributing translations joined by space in index order via a new `setCueTranslation` helper — covers out-of-order async arrivals.
+
+Assumptions flagged in Risks/notes for the reviewer: "markdown and subtitle export" = the `.md`+`.srt` bundle; default-on at 10s vs opt-in; strict `<` on span; speaker-less segments merge with each other; assist tags may reference merged-away cue numbers.
+
+Per the AGENTS.md gate, the plan needs a verification pass (`review_count >= 1`) and your approval before implementation — say the word and I'll run the review.
+The newest plan is `PLAN-012`. Let me read it and the governing records.Now let me verify the plan against the actual codebase files it references.Writer, manager, config, and `.env.example` all match the plan's anchors. Now checking the test files and web `groupSegments` claim.Now checking the remaining plan anchors: `routes.ts`/`store.ts` segment counting, test files, `config.test.ts`, and the stray `transcript-plan.json` at root.The plan claims backfill semantics stay exact. Let me check how `backfillFromStored` parses stored SRT.All plan anchors verified. Let me check the `Segment` type and the assist suite claim, then summarize divergences.Verification pass complete. All anchors check out (`manager.ts:186`, `STT_IDLE_TIMEOUT_S`, `insertTranslationLine` block-scan pattern, `groupSegments` speaker equality, `parseConfig` env in `beforeEach`), and the plan conforms to BDR-006/ADR-007/ADR-005/ADR-006. I found five divergences/imprecisions to patch:
+
+1. **Test plan typo**: `idx1 Speaker 2 -> cue 3` is impossible (cue number = index+1 = 2). For a numbering gap, the different-speaker seg must be idx2 after idx0+idx1 merged.
+2. **Ambiguous bookkeeping reset**: "reset `lastCue`/`cueOfIndex` for the new cue" can be misread as clearing the map, which would silently drop late translations for merged-away indices.
+3. **"web display untouched" overreach**: `Review.tsx` and `backfillFromStored` parse the `.srt`, so stored-derived views render merged cues as single segments; only the live socket path is untouched.
+4. **`meta.segments` undercount**: `cueCount` counts stored cues, so session summaries report fewer "segments" than emitted finals.
+5. **Contract mismatch**: `create` shows `log?: WarnLog` but the code has `log: WarnLog = silentLog`; and step 6's rationale misses the speaker-less final pair in the ASSIST_FAILED test.
+
+Applying the patches:One edit failed due to a whitespace mismatch. Let me check the actual text:All patches applied. Now committing only the plan file and logging the event per AGENTS.md.The warning refers to pre-existing untracked artifacts (node_modules, transcript-plan.json) — unrelated. Following the repo's convention of committing log entries:Verification pass on `PLAN-012` complete. Summary:
+
+## What checked out
+
+- **BDR-006 / ADR-007**: merged cues stay plain valid SRT; the new rewrite reuses the serialized read -> splice -> tmp -> rename cycle; `index + 1` cue binding preserved with deliberate numbering gaps.
+- **ADR-005 / ADR-006**: env-var config via zod, no new dependencies.
+- **Codebase anchors**: `SessionWriter.create` call at `manager.ts:186`, `STT_IDLE_TIMEOUT_S` in `config.ts` and `.env.example`, `insertTranslationLine`'s block-scan pattern in `srt.ts`, `groupSegments`' `undefined === undefined` speaker rule, `parseConfig` env in `app.test.ts` `beforeEach`. Translation routing design (map-driven joined render) correctly handles out-of-order arrivals.
+
+## Divergences patched (5)
+
+1. Test plan said `idx1 Speaker 2 -> cue 3` — impossible (cue = index+1); corrected to idx2 after an idx0+idx1 merge.
+2. "reset `lastCue`/`cueOfIndex`" was ambiguous — clarified the map accumulates; clearing it would silently drop late translations.
+3. "web display untouched" was overbroad — `Review.tsx` and `backfillFromStored` render from the stored `.srt`; only the live socket path is untouched.
+4. Added a risk note: `meta.segments` counts stored cues, undercounting emitted finals in session summaries.
+5. `create` contract showed `log?: WarnLog`; real signature is `log: WarnLog = silentLog`. Also broadened the step-6 rationale to cover the speaker-less final pair in the ASSIST_FAILED test.
+
+## Flagged for human judgment
+
+The merged-cue translation path **replaces** an existing line, while ADR-007 specifies `appendTranslation` "skips if already translated". It's scoped to merged cues (a case ADR-007's model didn't have), and the plan now calls it out explicitly as a possible ADR-level decision — your call whether it needs a superseding ADR.
+
+Frontmatter: `review_count: 1`, `patch: applied`, status left `draft` (developer moves it to `reviewed`/`approved`). Committed as `dc9dc75` (plan) + `48f501c` (log event).
+I'll start by exploring the workspace and finding the newest plan.The newest plan is PLAN-012. Let me read it.The plan is `draft` but has `review_count: 1` and `patch: applied`, so the hard gate (review_count >= 1, no pending patch) passes, and your instruction authorizes implementation. Let me explore the relevant files.Now let me read config, manager, and the test files.Now let me look at `app.test.ts`, `.env.example`, and the `Segment` type.Let me read the rest of `app.test.ts` and check `buildServer`/`index.ts` for how config flows.Let me check `store.ts` (for `meta.segments`/readSession) and the git state.I have full context now. The plan is well-specified with literal contracts. Let me set up the task list and implement.Config and env done. Now the two new SRT helpers in `srt.ts`.Now `writer.ts`: imports, options interface, bookkeeping fields, and the merge/routing logic.One fix needed in the merged path: `perCue` is a `let` captured by the enqueued closure, so TS will flag it as possibly `undefined` inside. Let me make it a `const`.Let me simplify that block to a cleaner single-const form.Now the tests. First `srt.test.ts` — add the two helpers to imports and their describe blocks.Now `writer.test.ts` — add the merging describe block and the `cueCount` import.Now `config.test.ts` additions and `app.test.ts` (env var + new e2e describe + `srtPathFor` import).Now the new e2e describe for the enabled merge path. I'll emit the second final only after the first cue is on disk, because `handleFinal` awaits `renameSpeakers` before `appendSegment` and back-to-back emits would invert call order.All code changes are in. Now let me run typecheck and the test suite.All 163 tests pass and typecheck is clean. Let me check the convention used by an already-implemented plan before updating PLAN-012's status and DoD.Convention confirmed. Updating PLAN-012: status, Status section, and DoD checkboxes.All tests green and plan updated. Let me check commit message style, then stage and commit only the relevant files (the untracked artifacts like `agent-output.log`, `transcript-*.json` are not mine to commit).`event.py` writes the log file but doesn't commit; the "log:" commits are separate. Order per AGENTS.md: commit code + plan record first, then log (binds HEAD), then commit the log file.Event logged and bound to `74496f2`. Now commit the log file per the "log:" convention.PLAN-012 implemented and closed out. Summary:
+
+**Implementation** (commit `74496f2`):
+- `server/config.ts` — `TRANSCRIPT_MERGE_MAX_S: z.coerce.number().nonnegative().default(10)`, documented block in `.env.example`
+- `server/session/srt.ts` — new `extendCue` (extends end timestamp + appends to source line, preserves translation line) and `setCueTranslation` (appends or replaces the last text line), both on the `insertTranslationLine` block-scan pattern
+- `server/session/writer.ts` — `SessionWriterOptions`, 4th `create` param, `lastCue`/`cueOfIndex`/`mergedCues`/`cueTranslations` bookkeeping. Merge rule: `seg.speaker === lastCue.speaker && seg.end_s - lastCue.start_s < mergeMaxS` (strict `<`, no gap constraint, speaker-less merges with speaker-less). `appendTranslation` routes merged indices to the surviving cue and rewrites the line with all contributing translations joined in index order; non-merged path unchanged
+- `server/session/manager.ts` — passes `{ mergeMaxS: config.TRANSCRIPT_MERGE_MAX_S }` to `SessionWriter.create`
+
+**Tests**: new describes for `extendCue`/`setCueTranslation` in `srt.test.ts`, a 7-test merge describe in `writer.test.ts` (threshold, speaker switch with numbering gap, speaker-less, chain merge, disabled byte-identical, both translation orderings, `index+1` binding), config parse/reject tests, and an e2e in `app.test.ts` with a second instance at `TRANSCRIPT_MERGE_MAX_S=5` asserting one merged cue `Speaker 1: Hello. there.` / `XIN CHÀO XIN CHÀO`. Shared e2e env pinned to `'0'` per the plan.
+
+**Verification**: `npm run typecheck` clean; `npm test` 163/163 green.
+
+**Closeout**: DoD items all ticked, `status: implemented`, plan record committed with the code, event logged via `event.py` bound to `74496f2`, log committed as `0c2cccf`.
+
+One note surfaced during implementation: `handleFinal` awaits `renameSpeakers` before `appendSegment`, so back-to-back same-speaker finals can reach `appendSegment` out of order (pre-existing behavior — cue 2 could append before cue 1 even before merging). The e2e test serializes the emits to stay deterministic; out-of-order `appendSegment` calls themselves remain an upstream behavior untouched per the plan's scope.

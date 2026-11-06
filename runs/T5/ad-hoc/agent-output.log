@@ -1,0 +1,24 @@
+I'll start by exploring the codebase to find the Review page and the audio player.The player already has a cycle-through speed button, but it's missing 0.75x. Let me check the UI components and existing tests to see what fits.Let me check how the Select component is used elsewhere and look at the transcript sync test coverage.The player already has a cycle-through rate button (`RATES = [1, 1.25, 1.5, 2]`), but it's missing 0.75x and cycling is clunky for 5 options. I'll replace it with a Select dropdown (matching the existing `ui/select.tsx` pattern used in Live.tsx) that shows a checkmark on the selected speed, keeping rate state in the component so it persists while on the page.
+
+Notes on requirements:
+- Immediate effect: `audio.playbackRate` applies without restarting playback.
+- Sync stays correct: highlighting is driven by `audio.currentTime` via `onTime` → `activeCueIndex`, which is media-time based and rate-independent (already covered by `parse-srt.test.ts`).
+- No existing test coverage for the player component itself (vitest runs in node env, no DOM testing infra), so no test updates needed.Now let me verify with typecheck and tests.Root `typecheck` passes but only covers `server/`/`scripts/`. My change is in `web/`, so let me typecheck that project too and run the test suite.All green. Let me run the project's linter on the changed file as a final check.Done. Summary of the change in `web/src/components/audio-player.tsx`:
+
+**What changed**
+- `RATES` now includes 0.75: `[0.75, 1, 1.25, 1.5, 2]`.
+- Replaced the cycle-through button with a `Select` dropdown (the same `ui/select` pattern used in `Live.tsx`), styled to match the player's compact ghost controls (`h-7`, `font-mono text-xs tabular-nums`). The selected speed gets a checkmark in the menu and stays shown in the trigger for as long as the user stays on the page.
+- `changeRate` sets `audio.playbackRate` directly, so speed changes take effect immediately with no reload or restart.
+- `onLoadedMetadata` now reapplies the selected rate, since `audio.load()` (e.g. a new `src`) resets `playbackRate` to 1.
+
+**Sync correctness**
+- Highlighting is driven by `audio.currentTime` → `onTime` → `activeCueIndex`, which is media-time based and independent of `playbackRate`, so transcript sync stays correct at every speed. `activeCueIndex` already has coverage in `parse-srt.test.ts`.
+
+**Tests**
+- No test coverage exists for the player component (vitest runs in `node` environment; only lib/server logic is tested), so no test changes were warranted per the task's condition.
+
+**Verification**
+- `npm test`: 145/145 pass
+- `npm run typecheck`: pass
+- `tsc -b` in `web/` (covers the edited file): pass
+- `oxlint` on the file: clean

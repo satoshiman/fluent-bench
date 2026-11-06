@@ -1,0 +1,158 @@
+I'll explore the codebase to understand the session WAV recording and pause/resume mechanics, then draft the implementation plan.Now let me check how audio flows in — websocket handler and client side — plus the existing tests and the WAV recorder test.`sendAudio` already gates on `active.paused`. Let me check git history and the app tests to understand the actual current behavior versus what the task describes.Let me look at the existing recording test and the pause test in detail.The existing code already gates `sendAudio` on `active.paused`. Let me verify the working tree state and run the tests to see what's actually failing.The tree is clean and `sendAudio` already early-returns while paused. Let me run the test suite to see the actual state.All tests pass and `sendAudio` already drops chunks while paused. Let me check the client capture path and remaining test file to be sure there isn't another route by which audio reaches the WAV during pause.All 145 tests pass, and `sendAudio` already early-returns on `active.paused` (manager.ts:269), so paused chunks never reach `WavRecorder.append` today — the invariant is held only at the call site, not inside the recorder. Let me check the governing records I need to cite before drafting the plan.Let me check how previous plan-drafting commits and their log entries were committed.The convention is confirmed: commit the plan doc, log a `--no-commit` event, commit the log. Now I'll draft PLAN-012.Now I'll commit the plan, log the event, and commit the log file per repo convention.Done. `PLAN-012-pause-resume-wav-recording.md` is drafted, committed, and logged — nothing else was touched.
+
+One finding worth flagging: the reported symptom does not fully reproduce on this tree. `sendAudio` already early-returns when `active.paused` (server/session/manager.ts:269), so paused PCM never reaches `WavRecorder.append`, and all 145 tests pass — including the existing assertion that paused audio is dropped before the WAV (app.test.ts:387-408).
+
+The plan is built around that: the no-append-while-paused invariant currently lives only at that single call site, so it proposes making it structural — `WavRecorder` gains `pause()`/`resume()`/`isPaused` with a call-time gate in `append`, `SessionManager.pause()`/`resume()` drives them (recorder resumes only after the new stream opens), and dedicated unit + end-to-end tests pin the contract (dropped bytes absent, contiguous same-file resume, stop-while-paused validity, non-recording no-op). This assumption is recorded in the plan's Risks/notes per your instruction.
+
+Plan is `status: draft` with `review_count: 0` — per the hard gate it needs a verification pass before implementation.
+Now let me check the session manager and the tests the plan references.The plan's claims about `manager.ts` check out so far. Now verifying the test-file references and the rest of the governing records.Code claims check out. Now verifying the remaining governing records and the web-client claim, plus PLAN-010's risk note.All governing records check out. Now verifying the remaining factual claims in the plan: `wavPathFor` signature, the routes wiring, and the "all 145 tests pass" claim by running the suite.A divergence: the plan claims all 145 tests pass, but 1 fails. Let me see which test and why.That failure is a 1ms timing drift in an unrelated lifecycle test. Let me check if it's flaky or persistent.Confirmed flaky — it passes in isolation. The observed failure is a 1ms wall-clock drift in a timestamp assertion, unrelated to this plan's scope. Let me run the full app.test.ts once more to gauge how flaky it is.Baseline verified: the suite is green except for a pre-existing flaky timestamp assertion (1ms drift, passes on re-run). Let me confirm typecheck is clean and check how the previous plan-draft event was logged for precedent.Typecheck is clean. The precedent shows plan-review events are logged unlinked (`--no-commit` Docs events).
+
+Verification summary: everything in the plan checks out against BDR-006, ADR-001/006/007, and the code (the `sendAudio` gate at manager.ts:269, `wx` open flag, `wavPathFor`, all referenced tests, the pinned wiring positions). One divergence found: the Context claim "all 145 tests pass" is unreliable — `full session lifecycle` has a flaky 1ms timestamp assertion that failed once under load and passes on re-run. Patching the plan now.Now committing the plan change, then logging the review event per the workflow.Verification pass complete on **PLAN-012-pause-resume-wav-recording**.
+
+## Checks performed
+
+**Against BDRs/ADRs** — all consistent:
+- BDR-006: single-file `.wav` bundle contract respected (resume continues same file, `wx` flag makes a second artifact impossible)
+- ADR-007: cue timestamps are `streamBaseS`-shifted with paused wall time excluded (verified in `openStream`, manager.ts:248-253); the plan's drop-not-silence choice correctly preserves cue/WAV alignment
+- ADR-001/ADR-006/BDR-002: backend-owned fix, no new dependencies, vitest + strict TS
+
+**Against the codebase** — all pinned claims verified:
+- `sendAudio` early-returns on `active.paused` (manager.ts:269); `WavRecorder` has no pause concept — plan's premise holds
+- Wiring points match real code: `pause()` flags at 288-290 before `stream.close()`; `resume()` stream reopen at 304 before flag flips
+- All referenced tests exist (`session audio recording`, `pause/resume`, `stop while paused ends the session normally`, `keeps cue start cumulative`), `wavPathFor` already imported, `npm run typecheck` clean
+
+## Divergence found and patched
+
+The Context claimed "all 145 tests pass." Actual run: **144 pass, 1 fails** — `full session lifecycle` asserts exact ms cue times (`00:00:01,000` vs received `00:00:01,001`) and drifts under load. It passes on re-run, so it's a pre-existing flake unrelated to the plan — but it can intermittently red the `npm test` DoD gate. Patched the Context claim and added a Risks note telling implementers to re-run rather than treat it as a regression.
+
+## Frontmatter
+
+`review_count: 0 → 1`, `patch: n/a → applied`. Status stays `draft` (developer-only transition per AGENTS.md). Nothing implemented; two commits made — the plan patch and the log event (`--no-commit`, per the draft-event precedent).
+The newest plan is PLAN-012 (pause/resume WAV recording). It has `review_count: 1` and `patch: applied`, so it passes the hard gate. Let me read the relevant files.Now let me look at the relevant parts of `server/app.test.ts`.I have the full picture. The plan (PLAN-012) passes the hard gate (`review_count: 1`, `patch: applied`), and the user's instruction is the approval to implement. Implementing now.Now the tests. First the unit tests in `wav-recorder.test.ts`:Now running the gates: `npm run typecheck` and `npm test`.All gates pass: 151 tests green (6 new), typecheck clean. Now closing out the plan record: ticking DoD items and setting `status: implemented`.Now committing. Checking git state and recent commit style first.Committed. Now logging the completion event via `event.py` (auto-pulling files from the commit).PLAN-012 implemented, verified, and closed out.
+
+**Changes**
+- `server/audio/wav-recorder.ts` — added `pause()`, `resume()`, `isPaused`, and a private `paused` flag. `append()` checks the flag at call time and resolves without writing, so queued pre-pause bytes still land while post-pause submissions are dropped. [wav-recorder.ts:66-89](file://~/fluent-bench/runs/chain/work/server/audio/wav-recorder.ts)
+- `server/session/manager.ts` — `pause()` calls `active.recorder?.pause()` before closing the stream; `resume()` calls `active.recorder?.resume()` only after `openStream` succeeds and the paused flags flip. [manager.ts:288-310](file://~/fluent-bench/runs/chain/work/server/session/manager.ts)
+- Tests: 3 unit cases in `wav-recorder.test.ts` (drop/resume same-file, idempotent `isPaused`, finalize-while-paused) and 3 end-to-end cases in `app.test.ts` (pause/resume WAV byte-exactness, stop-while-paused, non-recording session produces no WAV).
+
+**Gates** — `npm test`: 151/151 pass; `npm run typecheck`: clean.
+
+**Closeout** — DoD items ticked, `status: implemented`. Commits:
+- `d1f9948` Implement PLAN-012: pause/resume for session WAV recording
+- `fb63e9c` log: implement PLAN-012 pause/resume WAV recording
+
+The only working-tree leftovers are pre-existing untracked environment artifacts (`.start_time`, `agent-output.log`, `node_modules` symlink, `transcript-*.json`), left alone intentionally.
+I'll explore the workspace to understand the codebase structure and find the WAV recording code.Now let me check how tests construct config, how `audio_file` is consumed downstream, and the writer header comment.Let me check `server/index.ts` to see how deps flow into `SessionManager`.I have the full picture. Key facts for the plan:
+
+- `WavRecorder` (`server/audio/wav-recorder.ts`) owns the file: serialized write queue, `wx` create, header patched on `finalize`, pause flag checked at call time.
+- `SessionManager.start()` creates it via `wavPathFor` (`<stem>.wav`); `sendAudio` tees chunks; `finish()` finalizes.
+- ADR-005 pins env-only config; `parseConfig` already takes raw env (test seam). `SessionManagerDeps` is the existing injection seam used by `buildServer(config, deps)` in `app.test.ts`.
+- ADR-007 pins the `<stem>.wav` bundle name, so part 1 must keep that name; rotation adds `<stem>.part-NNN.wav` siblings.
+
+Drafting PLAN-013 now.Now I'll commit the plan document, then log the event per the workflow.Done. `PLAN-013-wav-size-cap-rotation.md` is drafted, committed, and logged. Nothing else was changed.
+
+Key decisions pinned in the plan:
+
+- **Config**: `WAV_MAX_FILE_MB` env var via `envSchema` (ADR-005), `z.coerce.number().int().positive().default(500)`, documented in `.env.example`.
+- **Rotation semantics**: `WavRecorderOptions.maxBytes` bounds on-disk size per part (header included); writes split at `blockAlign` boundaries so every file stays `<= maxBytes` with no split samples; rotation finalizes the current part before opening the next, all serialized on the existing write queue.
+- **Naming**: part 1 stays `<stem>.wav` (ADR-007 bundle contract preserved); rotations produce `<stem>.part-002.wav`, `.part-003.wav`, ... opened with `wx`.
+- **Test seam**: `SessionManagerDeps.wavMaxBytes` resolved lazily in `start()` so `app.test.ts` can inject byte-scale caps; unit tests exercise `maxBytes` directly.
+- **Assumptions in Risks**: multi-part sessions extend the three-file ADR-007 bundle additively (part-001 naming rejected as it would rename the pinned `<stem>.wav`); Review playback serves part 1 only (flagged as follow-up); MiB unit confirmed.
+
+The plan has `review_count: 0` / `patch: n/a` — it needs a verification pass before implementation per the hard gate.
+I'll start by exploring the context hierarchy and finding the newest plan.Now I'll read the governing records and the relevant code in parallel.Now the codebase. Let me look at the relevant files.The grep hit log artifacts. Let me scope the search to source directories.Code claims check out so far. Let me verify the remaining references: PLAN-010's crash-limitation note, scripts that touch `.wav`, and git state.Baseline is green: 151 tests pass, typecheck clean. PLAN-010's crash-limitation note and the env/test conventions all check out. Let me look at how the previous review pass was logged, then do the final divergence analysis.Verification pass complete. Summary of findings:
+
+**Verified against records and code:**
+- BDR-006's three-file bundle: the plan's additive `.part-NNN.wav` shape is explicitly flagged in Risks as a candidate for a new ADR rather than silently violated — correct treatment per the precedence rule.
+- ADR-005 (env-only tunables), ADR-006 (no new deps, vitest co-located), ADR-001 (server-only change), ADR-007 (`wavPathFor`/`audio_file`/audio route unchanged, serving part 1) all confirmed against `config.ts:13`, `markdown.ts:47`, `routes.ts:87`, `store.ts:51`.
+- Code claims verified: `wx` flag, 44-byte header, `blockAlign=2` (min cap 46), serialized queue, `paused` gate at `append` call time (wav-recorder.ts:67), `sendAudio` append-rejection → `recorderFailed` (manager.ts:275-280), `buildServer` forwards deps untouched (index.ts:23), `meta.audio_file`/`finish()` wiring.
+- Test math checks out (maxBytes 144 → 100-byte payload cap → 100/100/50; cap 101 → sample-aligned 100; maxBytes 45 < 46 → RangeError; 300 → 256 room, 600 bytes → 3 parts).
+- Baseline: `npm test` 151/151 green, `npm run typecheck` clean.
+
+**One divergence found:** the `app.test.ts` rotation-test narrative asserts on size-patched WAV file state right after `provider.audio` reaches N. But `recorder.append` is fire-and-forget on the serialized queue — send count doesn't guarantee the queued writes/rotation have landed. The codebase's convention (existing tests) asserts after `POST /stop`, where `finish()` → `recorder.finalize()` drains the queue. An implementer following the plan literally would write a flaky test. Patching it now.Now commit the plan change (no Devin trailer, per global rules).Now log the review event per the workflow (matching the PLAN-012 precedent: `--no-commit` Docs event, then a normal commit of the log file).Done. Verification pass 1 on **PLAN-013-wav-size-cap-rotation** complete.
+
+**Result:** `review_count: 0 → 1`, `patch: n/a → applied`, `status` stays `draft`.
+
+**What held up:**
+- BDR-006's three-file bundle — the `.part-NNN.wav` extension is flagged in Risks as an ADR candidate, not silently violated
+- ADR-001/005/006/007 — server-only change, env-only tunable, no new deps, `wavPathFor`/`audio_file`/audio route untouched
+- Every code-level claim: `wx` flag, 44-byte header + blockAlign 2 (46-byte min cap), serialized write queue, `paused` call-time gate, `sendAudio` → `recorderFailed` path, `buildServer` deps forwarding, lazy cap resolution requirement
+- Test math: 144→100B cap→100/100/50 split; 101 cap→sample-aligned 100; 45<46→RangeError; 300→256 room, 600B→3 parts
+- Baseline green: 151/151 tests, typecheck clean
+
+**One divergence patched:** the `app.test.ts` rotation test described asserting size-patched WAV state right after `provider.audio` hit N — but `recorder.append` is fire-and-forget on the write queue, so that ordering races. Reordered file assertions after `POST /stop` (finalize drains the queue), matching existing test conventions.
+
+**Commits:**
+- `cd2331b` plan patch + frontmatter
+- `d278ac1` log event (`--no-commit` Docs event, matching PLAN-012 precedent)
+
+Plan is now implementable under the hard gate; not implemented per instructions.
+Plan PLAN-013 is the newest. Its gate state is `review_count: 1`, `patch: applied`, so it's implementable. Reading the relevant files now.Now reading the tests and `.env.example`.Let me check `markdown.ts` (wavPathFor) and `package.json` scripts.Step 1: config + `.env.example`.Step 2: `wav-recorder.ts` rotation support.Step 3: `manager.ts` — add the `wavMaxBytes` dep seam and lazy resolution in `start()`.Step 4: tests. First the recorder unit tests.Now `app.test.ts`: import the deps type, hold the deps object in a variable, and add the end-to-end rotation test.All edits in place. Running the gates.All green: 160 tests pass, typecheck clean. Now closing out the plan record.Convention confirmed. Committing code + plan record (untracked scaffold files stay out).PLAN-013 implemented and closed out. Summary:
+
+**Implementation**
+- `server/config.ts`: `WAV_MAX_FILE_MB` added to `envSchema` (int, positive, default 500); documented in `.env.example`.
+- `server/audio/wav-recorder.ts`: `maxBytes` option with `RangeError` validation (`< 46`); append loop splits at `blockAlign` boundaries, rotates via `partPathFor` into `<stem>.part-NNN.wav`; shared `closePart()` used by both rotation and `finalize()`; `partPaths`/`partCount` getters; `bytesWritten` is now a cross-part total; `abort()` unlinks every part.
+- `server/session/manager.ts`: `SessionManagerDeps.wavMaxBytes` test seam, deps retained on the instance, cap resolved lazily in `start()` as `deps.wavMaxBytes ?? config.WAV_MAX_FILE_MB * 1024 * 1024`.
+- `GET /api/sessions/:id/audio`, `meta.audio_file`, and `wavPathFor` untouched; still part 1.
+
+**Tests added** — 7 unit cases in `wav-recorder.test.ts` (rotation, oversize-chunk split, sample alignment, part ordering, pause isolation, abort cleanup, too-small cap), config parsing cases, and an end-to-end rotation test in `app.test.ts` using a 300-byte cap (600 bytes of PCM → parts of 256/256/88, verified header patches, payload concat, `audio_file`, and part-1 audio route).
+
+**Gates:** `npm test` 160/160 pass, `npm run typecheck` clean.
+
+**Closeout:** all DoD items ticked, `status: implemented`, committed as `04857c8`, event logged via `event.py` and committed as `8c358f9`.
+I'll explore the codebase to understand the recording pipeline and session UI before drafting the plan.Let me check the UI design conventions and remaining pieces (transcript components, css, PLAN-003, relevant BDRs).Let me check the design-language plan, ADR-001, and the vitest config before drafting.I have the full picture. Drafting the plan now.Done. Drafted and committed `PLAN-014-recording-status-ui.md` (2 commits: plan doc + log event, matching the repo's commit/log convention).
+
+Key findings that shaped the plan:
+
+- `Live.tsx` already renders a `rec` badge, but it's driven by `record_audio` — the flag captured at session start — so it can't reflect failure. Mid-session `append` failures only `log.warn` (`recorderFailed` in [manager.ts](file://~/fluent-bench/runs/chain/work/server/session/manager.ts)), and `finalize` failures only `log.error`. Create failures do reach the UI as a toast but with a raw fs message.
+- The error-notification path needs no new plumbing: `error` WS events already become sonner toasts, and `start()`'s catch already toasts REST errors.
+
+Plan design, pinned in the doc:
+
+- **Server:** `SessionInfo` gains `recording: 'off' | 'recording' | 'paused' | 'failed'`, derived and stored on `active.info` so broadcasts, REST payloads, and reconnect snapshots all carry the real state. `failed` is sticky (a failed recorder that pauses still reports `failed`, not `paused`).
+- **Errors:** one `RECORDING_FAILED` error event + a `session` rebroadcast on mid-session append failure; a `RECORDING_FAILED` event before `session: idle` on finalize failure; `WavRecorder.create` rejection rethrown as `RecordingUnavailableError` (`code: 'RECORDING_UNAVAILABLE'`, message `session audio could not be recorded: <cause>`).
+- **Test seam:** `SessionManagerDeps.recorderFactory`, matching the existing `providerFactory` pattern, so failures are deterministic in `app.test.ts`.
+- **UI:** badge keyed on `recording`: pulsing `LiveDot` + `rec` (per PLAN-003's "live/recording = primary pulsing dot"), `rec paused` (outline + Pause icon), `rec failed` (destructive), nothing when off/stopped.
+- **Risks** record the assumptions, including that start-failure keeps PLAN-010's fail-the-session semantics.
+
+Frontmatter: `status: draft`, `review_count: 0`, `patch: n/a` — per the hard gate it needs a verification pass before implementation.
+I'll start by finding the newest plan and surveying the context hierarchy.Newest plan is PLAN-014. Reading it along with the governing BDRs/ADRs.Now let me examine the codebase files the plan touches.Manager verified. Now checking the web side, tests, and remaining details.Checking the remaining details: wav-recorder append semantics, api.ts error propagation, web test fixtures that construct `SessionInfo`, and `record_audio` usages.Two likely divergences found already (constructor-resolved `recorderFactory` vs. post-`buildServer` test injection; the web test fixture that builds `SessionInfo`). Let me confirm the fixture and read BDR-006.Verification pass complete. I checked every pinned contract in PLAN-014 against the codebase and governing records. Most claims verify cleanly (badge position, `LiveDot`/`animate-pulse-soft`, badge variants, `code?: string` on `ServerEvent`, toast paths, `pause()`/`resume()` mutation points, error-handler 500 shape, WS connect-time `session` replay, lazy `wavMaxBytes` precedent, BDR-006 retention-by-default, PLAN-010/012 semantics). Four divergences need patching:
+
+1. **`recorderFactory` resolution timing** — the plan pins constructor resolution, but the test plan injects via `deps.recorderFactory = ...` inside test bodies, *after* `beforeEach` already ran `buildServer` → `new SessionManager`. Constructor resolution would capture the default before the stub exists. Must resolve lazily at the `start()` call site, same pattern as `wavMaxBytes` (PLAN-013).
+2. **`use-live-session.test.ts` fixture** — plan claims "needs no changes", but `info()` at line 102-113 builds a `SessionInfo` literal missing the new required `recording` field → `tsc -b` fails.
+3. **`as WavRecorder` cast** — `WavRecorder` is a class with private fields; a plain stub object can't be `as`-cast to it (TS2352). Needs `as unknown as WavRecorder`.
+4. **"at most once" race** — the pinned `.catch` broadcasts unconditionally. Two chunks sent before the first rejection settles both enqueue `append`s → two `RECORDING_FAILED` broadcasts. Needs a re-check inside the catch.
+
+Patching the plan now:All patches applied. Committing only the plan file, then logging the event per the workflow.Review pass 1 complete on `PLAN-014-recording-status-ui`. Verified against BDRs, ADRs, and the codebase; 4 divergences patched in place; frontmatter updated to `review_count: 1`, `patch: applied`.
+
+**Verified clean:**
+- Badge row position (after `lag`, before `assist`), `LiveDot`/`animate-pulse-soft`/`bg-primary` per PLAN-003, `secondary`/`outline`/`destructive` badge variants all exist
+- `error` `ServerEvent` carries `code?: string` on both ends; `handleEvent` 'error' → `toast.error`, `start()` catch toasts; WS connect replays `session` with live `info`; `setErrorHandler` gives unmapped codes a 500 `{ error, code }` body matching the `RECORDING_UNAVAILABLE` test
+- `pause()`/`resume()` `info.paused` mutation points, `finish()` ordering (finalize catch → `session: idle`), `sendAudio` early-return while paused
+- PLAN-010 create-failure semantics, PLAN-012 pause semantics, BDR-006 retention-by-default restatement, ADR-006 gates (`npm test`, `tsc --noEmit`, `npm --prefix web run build`)
+
+**Patched divergences:**
+1. `recorderFactory` was pinned to constructor resolution, but tests assign `deps.recorderFactory` after `beforeEach`'s `buildServer` → repinned to lazy `start()`-site resolution (same pattern as `wavMaxBytes`, PLAN-013)
+2. Mid-session failure pinned code now re-checks `recorderFailed` inside the `.catch` — two chunks in flight can both enqueue rejecting `append`s, which would double-broadcast
+3. Stub cast corrected to `as unknown as WavRecorder` (private fields make a direct `as` fail under tsc)
+4. `use-live-session.test.ts`'s `info()` fixture must gain `recording` — the "needs no changes" claim was wrong; added to scope, steps, and test plan, plus `npm --prefix web run build` to the DoD
+
+Committed as `5880a6b` (plan file only) and logged the event. Plan stays `status: draft` — awaiting your `reviewed`/`approved`.
+I'll start by finding the newest plan in the implement-plan directory.Newest plan is PLAN-014. Reading it now.The plan is `review_count: 1`, `patch: applied` so the hard gate passes. Now let me read the files in scope.Now let me look at the test files, `WavRecorder`, and the `LiveDot` component.Let me check `LiveDot`, the error handler, and the ws/routes surface.I have the full picture. Let me check the remaining surfaces: `routes.ts`, other `SessionInfo` literals in web, and project scripts.All context gathered. Now I'll implement per the plan.Server side done. Now the web side.Now the tests in `app.test.ts`: add the `WavRecorder` import and the four new cases at the end of the `session audio recording` describe.Let me verify `ws.ts` routes binary data to `sendAudio`, then run the gates.Confirmed. Running the gates now.All gates pass. Now closing out the plan: tick DoD items and set `status: implemented`.Now let me check the git state and commit style before committing.The dirty log file is a pending log entry from earlier work (matches the project's commit pattern). I'll commit the implementation first, log the event, then commit the log file as the project does.Done. PLAN-014 is implemented, committed, and logged.
+
+**Commits**
+- `ef1fb6a` Implement PLAN-014: surface recording status and errors in the UI
+- `9acd6bf` log: implement PLAN-014 recording status and errors in the UI
+
+**Changes**
+- `server/session/manager.ts`: `RecordingState` type, `recording` field on `SessionInfo`, `RecordingUnavailableError` (`RECORDING_UNAVAILABLE`), lazy `recorderFactory` seam on `SessionManagerDeps`, state transitions on `start`/`pause`/`resume`, once-only `RECORDING_FAILED` error + `session` rebroadcast on append failure, and the finalize-failure error broadcast before `session: idle`.
+- `web/src/lib/types.ts`: mirrored `RecordingState` and the new field.
+- `web/src/pages/Live.tsx`: state-driven badges (`rec` pulsing LiveDot / `rec paused` outline+Pause / `rec failed` destructive); `'off'` renders nothing.
+- `server/app.test.ts`: 5 new cases under `session audio recording` covering the pinned contracts.
+- `web/src/lib/use-live-session.test.ts`: fixture gained `recording: 'off'`.
+
+**Gates**: `npm test` 165/165 (the known 1 ms cue-time flake failed once, passed on re-run as the plan anticipates), `npm run typecheck` clean, `npm --prefix web run build` clean.
+
+**Plan record**: `CONTEXTS/03-implement-plan/PLAN-014-recording-status-ui.md` now has all DoD items ticked and `status: implemented`.
+
+One caveat: the plan's gate note mentions a manual `npm run dev` smoke check of the badge states; that is a manual check, not a DoD item, and I did not run an interactive dev-server session. The badge states are covered by the type-level contract and build.

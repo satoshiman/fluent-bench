@@ -1,0 +1,904 @@
+From a1d7cae49c2b06a8564be8acd1559141507110c8 Mon Sep 17 00:00:00 2001
+From: Satoshi Man <mrvuong.bitcoin@gmail.com>
+Date: Thu, 5 Nov 2026 22:35:06 +0700
+Subject: [PATCH 1/7] plan: draft PLAN-012 for on-demand WebVTT session export
+
+---
+ .../PLAN-012-vtt-session-export.md            | 215 ++++++++++++++++++
+ 1 file changed, 215 insertions(+)
+ create mode 100644 CONTEXTS/03-implement-plan/PLAN-012-vtt-session-export.md
+
+diff --git a/CONTEXTS/03-implement-plan/PLAN-012-vtt-session-export.md b/CONTEXTS/03-implement-plan/PLAN-012-vtt-session-export.md
+new file mode 100644
+index 0000000..25765b6
+--- /dev/null
++++ b/CONTEXTS/03-implement-plan/PLAN-012-vtt-session-export.md
+@@ -0,0 +1,215 @@
++---
++id: PLAN-012-vtt-session-export
++status: draft
++date: 2026-11-05
++review_count: 0
++patch: n/a
++---
++
++# PLAN-012: On-demand WebVTT export of session transcripts
++
++## Status
++
++draft
++
++## Governing records
++
++- BDR-006: the canonical session bundle is `<stem>.md` + `<stem>.srt` +
++  `<stem>.wav`, all plain local files readable with any tool. This plan
++  adds NO new stored artifact: the `.vtt` is a derived, on-demand export
++  of the canonical `.srt`, which remains the single source of truth.
++- ADR-007: pins the three-file layout, the bilingual cue format, and the
++  write semantics this export reads through (`stored.srt`). ADR-007
++  rejected WebVTT *as the canonical storage format*; an export view does
++  not revisit that decision. Persisting a `<stem>.vtt` sibling would
++  change the layout and require a new ADR first - out of scope here (see
++  Risks).
++- ADR-006: Fastify + TypeScript backend, React + TS + Tailwind web client;
++  no new dependencies (the SRT -> VTT conversion is written by hand, same
++  precedent as hand-rolled SRT emit/parse).
++- BDR-002: no new dependencies, no per-use cost; conversion is per-request
++  CPU over a < 100 KB file.
++
++## Scope
++
++In scope:
++
++1. `server/session/vtt.ts` (new): pure `srtToVtt` converter.
++2. `GET /api/sessions/:id/export.vtt` route returning the derived VTT as
++   a `text/vtt` attachment.
++3. `sessionsApi.vttUrl` in the web client plus a download affordance on
++   the Review page header and the Sessions list row.
++4. Tests for the converter and the route.
++
++Out of scope: writing `.vtt` to disk (would extend the ADR-007 bundle),
++editing stored `.srt`, WebVTT `<v Speaker>` voice tags, `NOTE` metadata
++blocks, any change to the live writer or socket protocol, SRT download
++button (the `.srt` already sits on disk next to the `.wav`).
++
++## Contracts (literal)
++
++### `server/session/vtt.ts`
++
++```ts
++export function srtToVtt(srt: string): string;
++```
++
++Transformation rules, applied block-by-block after splitting on `\n{2,}`
++and dropping empty blocks:
++
++- Output always starts with the literal line `WEBVTT`, then a blank line.
++- Per block: if the first line contains ` --> ` it is the timing line
++  (identifier-less cue); otherwise the first line is a cue identifier
++  kept verbatim on its own line (our SRT cue numbers become valid VTT
++  cue identifiers) and the second line is the timing line.
++- Timing line: emitted verbatim except every `,` replaced by `.`
++  (SRT `HH:MM:SS,mmm` -> VTT `HH:MM:SS.mmm`). No re-parsing or re-
++  formatting of the timestamps themselves.
++- Payload (text) lines: emitted verbatim except cue-text escaping, in
++  this order: `&` -> `&amp;`, then `<` -> `&lt;`, then `>` -> `&gt;`.
++  Escaping `>` also neutralizes a literal `-->` inside text (becomes
++  `--&gt;`), which raw VTT cue text forbids.
++- Blocks are joined by `\n\n`; the file ends with a single trailing
++  `\n` after the last block. Empty input yields `WEBVTT\n` exactly.
++
++Example. Stored `.srt` fragment:
++
++```
++1
++00:00:02,000 --> 00:00:04,800
++Speaker 1: Hello.
++Xin chào.
++```
++
++`srtToVtt` output:
++
++```
++WEBVTT
++
++1
++00:00:02.000 --> 00:00:04.800
++Speaker 1: Hello.
++Xin chào.
++```
++
++### HTTP route
++
++`GET /api/sessions/:id/export.vtt` in `registerSessionRoutes`:
++
++- `readSession(sessions.dir, id)`; `null` -> `404` with
++  `{ error: 'session not found: <id>' }` (same shape as the sibling
++  routes).
++- Otherwise `200` with headers:
++  - `Content-Type: text/vtt; charset=utf-8`
++  - `Content-Disposition: attachment; filename="<stem>.vtt"` where
++    `stem` = `path.basename(stored.meta.file, '.md')`
++- Body: `srtToVtt(stored.srt)`. An empty transcript still returns `200`
++  with the `WEBVTT\n` body (a valid, importable empty file).
++- Works for in-progress sessions: the export reflects the `.srt` as it
++  exists at request time.
++
++### Web client
++
++```ts
++// web/src/lib/api.ts, inside sessionsApi:
++vttUrl: (id: string) =>
++  `/api/sessions/${encodeURIComponent(id)}/export.vtt`,
++```
++
++## Steps
++
++1. `server/session/vtt.ts` (new): implement `srtToVtt` exactly per the
++   contract above. Pure function, no I/O, no imports needed beyond
++   nothing. Cue-text escaping helper `escapeVttText(line)` local to the
++   module.
++2. `server/session/vtt.test.ts` (new): see Test plan.
++3. `server/session/routes.ts`: register
++   `app.get('/api/sessions/:id/export.vtt', ...)` next to the existing
++   `:id` routes, importing `srtToVtt` and `node:path`. Fastify matches
++   the static `export.vtt` segment before the `:id` param route, so no
++   ordering hazard; still declare it after `GET /api/sessions/:id` for
++   readability.
++4. `server/app.test.ts`: add export-route cases (see Test plan) using the
++   same session-fixture harness the stored-session tests already use.
++5. `web/src/lib/api.ts`: add `vttUrl` per contract.
++6. `web/src/pages/Review.tsx`: in the header row (the
++   `flex flex-wrap items-center gap-2` div, after the speaker badges),
++   add a download button using Base UI's `render` prop (precedent:
++   `web/src/components/ui/alert-dialog.tsx`):
++
++   ```tsx
++   <Button
++     variant="outline"
++     size="sm"
++     render={<a href={sessionsApi.vttUrl(meta.id)} download />}
++   >
++     <Download data-icon="inline-start" />
++     VTT
++   </Button>
++   ```
++
++   `Download` joins the existing `lucide-react` import.
++7. `web/src/pages/Sessions.tsx`: in the row actions cell (next to the
++   Review button) add an icon-sized variant of the same link:
++   `size="icon-sm"`, `aria-label="Export VTT"`, `Download` icon only, no
++   text. Same `render={<a .../>}` pattern.
++8. Verify: `npm test`, `npm run typecheck`, `npm --prefix web run lint`.
++9. Commit, then log via `CONTEXTS/04-logs/event.py` (type `Feature`).
++
++## Test plan
++
++- `vtt.test.ts`:
++  - single bilingual cue -> `WEBVTT` header + identifier + dot-decimal
++    timing + both text lines;
++  - multi-cue input -> blocks separated by one blank line, file ends
++    with one `\n`;
++  - identifier-less block (first line is the timing line) -> no phantom
++    identifier emitted;
++  - escaping: text containing `a & b`, `<tag>`, `x --> y` produces
++    `a &amp; b`, `&lt;tag&gt;`, `x --&gt; y`;
++  - empty string and whitespace-only input -> `WEBVTT\n`;
++  - timestamp regression: `00:00:02,000` -> `00:00:02.000` (and an
++    hours-padded `01:02:03,456` case).
++- `app.test.ts`:
++  - `GET /api/sessions/:id/export.vtt` on a fixture session: `200`,
++    `content-type` starts with `text/vtt`, `content-disposition`
++    contains `filename="<stem>.vtt"`, body starts `WEBVTT` and contains
++    ` --> ` with `.` decimals;
++  - unknown id -> `404` with the standard error shape.
++- Manual acceptance: export from the Review button, drop the `.vtt`
++  next to the session `.wav` in VLC (or a video editor), confirm cues
++  render at the right times with speaker prefixes intact.
++
++## Risks and notes
++
++- Assumption (no clarification round per request): "vtt export" means a
++  downloadable `.vtt` derived on demand, not a fourth stored bundle
++  file. If the owner actually wants `<stem>.vtt` persisted in
++  `sessions/`, that extends the ADR-007 file layout and must be
++  escalated as a new ADR before implementation; the endpoint design
++  here stays valid either way.
++- Assumption: speaker identity exports as the existing `Name: ` text
++  prefix (byte-faithful to the SRT). `<v Name>` voice tags are a trivial
++  follow-up inside `srtToVtt` if wanted.
++- Escaping means exported text differs byte-wise from the `.srt` when
++  `&`, `<`, `>` occur; that is required for spec-valid VTT cue text.
++- `meta.file` is an absolute server path; only its basename reaches the
++  `Content-Disposition` header, so no server path leaks.
++- Cue identifiers (SRT numbers) survive as VTT cue identifiers; both
++  are `index + 1`, keeping the same binding to zero-based event indices
++  documented in ADR-007.
++- Exporting mid-session yields a VTT with EN-only cues where
++  translations have not landed yet - same transient state the `.srt`
++  itself exposes (ADR-007 consequence).
++
++## Definition of Done
++
++- [ ] `srtToVtt` implemented per contract; `vtt.test.ts` green.
++- [ ] `GET /api/sessions/:id/export.vtt` returns spec-valid VTT with
++      correct headers; `app.test.ts` green.
++- [ ] Review header and Sessions row expose the VTT download.
++- [ ] `npm run typecheck` clean; `npm test` green;
++      `npm --prefix web run lint` clean.
++- [ ] Manual: exported `.vtt` plays alongside the `.wav` in VLC or a
++      video editor with correct cue timing.
++- [ ] Plan status set to `implemented`; completion event logged.
+-- 
+2.50.0
+
+
+From aa492605cb5600674def01e72a1717c00726abf4 Mon Sep 17 00:00:00 2001
+From: Satoshi Man <mrvuong.bitcoin@gmail.com>
+Date: Thu, 5 Nov 2026 22:35:18 +0700
+Subject: [PATCH 2/7] log: draft PLAN-012 for on-demand WebVTT session export
+
+---
+ CONTEXTS/04-logs/2026-11-05.md | 38 ++++++++++++++++++++++++++++++++--
+ 1 file changed, 36 insertions(+), 2 deletions(-)
+
+diff --git a/CONTEXTS/04-logs/2026-11-05.md b/CONTEXTS/04-logs/2026-11-05.md
+index a251d67..a20bbb0 100644
+--- a/CONTEXTS/04-logs/2026-11-05.md
++++ b/CONTEXTS/04-logs/2026-11-05.md
+@@ -1,11 +1,11 @@
+ ---
+ date: "2026-11-05"
+-events_count: 88
++events_count: 89
+ ---
+ 
+ # Events on 2026-11-05
+ 
+-Total events: **88**
++Total events: **89**
+ 
+ ## Table of contents
+ 
+@@ -97,6 +97,7 @@ Total events: **88**
+ - [17:56 - Add README and MIT license](#1756---add-readme-and-mit-license)
+ - [17:58 - Update license copyright to real name](#1758---update-license-copyright-to-real-name)
+ - [18:31 - Standardize workflow name in README](#1831---standardize-workflow-name-in-readme)
++- [22:35 - Draft PLAN-012: on-demand WebVTT session export](#2235---draft-plan-012-on-demand-webvtt-session-export)
+ 
+ ---
+ 
+@@ -3124,3 +3125,36 @@ README.md
+ None
+ 
+ ---
++## 22:35 - Draft PLAN-012: on-demand WebVTT session export
++
++**Scope:** CONTEXTS/03-implement-plan | **Type:** Docs | **Commit:** a1d7cae @ doc-centric-vague
++
++## Scope
++CONTEXTS/03-implement-plan
++
++## Type
++Docs
++
++## Commit
++- **Hash:** a1d7cae
++- **Repo:** doc-centric-vague
++- **Message:** plan: draft PLAN-012 for on-demand WebVTT session export
++- **Author:** Satoshi Man <mrvuong.bitcoin@gmail.com>
++- **Date:** 2026-11-05 22:35:06 +0700
++
++## User request
++sessions need a vtt export so transcripts can be imported into video tools, add it
++
++## Reason
++BDR-006/ADR-007 keep .srt canonical; a derived on-demand VTT export adds the requested capability without changing the stored bundle or adding dependencies (BDR-002).
++
++## Description
++Drafted implementation plan for a VTT export: pure srtToVtt converter in server/session/vtt.ts, GET /api/sessions/:id/export.vtt returning text/vtt attachment derived from stored .srt, sessionsApi.vttUrl, download buttons on Review header and Sessions rows. No stored .vtt artifact; .srt stays canonical per BDR-006/ADR-007.
++
++## Files changed
++CONTEXTS/03-implement-plan/PLAN-012-vtt-session-export.md
++
++## Notes
++Assumption recorded: export is derived on demand, not a persisted sibling file (that would need a new ADR extending the three-file bundle). Plan is draft, review_count 0, hard gate applies before implementation.
++
++---
+-- 
+2.50.0
+
+
+From 29ee1971aaa7d968497b0661db6e0ffd0db85cc7 Mon Sep 17 00:00:00 2001
+From: Satoshi Man <mrvuong.bitcoin@gmail.com>
+Date: Thu, 5 Nov 2026 22:38:04 +0700
+Subject: [PATCH 3/7] plan: review PLAN-012 pass 1, patch divergences
+
+---
+ .../PLAN-012-vtt-session-export.md            | 19 ++++++++++++-------
+ 1 file changed, 12 insertions(+), 7 deletions(-)
+
+diff --git a/CONTEXTS/03-implement-plan/PLAN-012-vtt-session-export.md b/CONTEXTS/03-implement-plan/PLAN-012-vtt-session-export.md
+index 25765b6..cd7414f 100644
+--- a/CONTEXTS/03-implement-plan/PLAN-012-vtt-session-export.md
++++ b/CONTEXTS/03-implement-plan/PLAN-012-vtt-session-export.md
+@@ -2,8 +2,8 @@
+ id: PLAN-012-vtt-session-export
+ status: draft
+ date: 2026-11-05
+-review_count: 0
+-patch: n/a
++review_count: 1
++patch: applied
+ ---
+ 
+ # PLAN-012: On-demand WebVTT export of session transcripts
+@@ -55,7 +55,9 @@ export function srtToVtt(srt: string): string;
+ ```
+ 
+ Transformation rules, applied block-by-block after splitting on `\n{2,}`
+-and dropping empty blocks:
++and dropping empty or whitespace-only blocks (`b.trim() !== ''`, the same
++predicate `insertTranslationLine` in `server/session/srt.ts` uses), so
++whitespace-only input produces no blocks:
+ 
+ - Output always starts with the literal line `WEBVTT`, then a blank line.
+ - Per block: if the first line contains ` --> ` it is the timing line
+@@ -125,10 +127,12 @@ vttUrl: (id: string) =>
+ 2. `server/session/vtt.test.ts` (new): see Test plan.
+ 3. `server/session/routes.ts`: register
+    `app.get('/api/sessions/:id/export.vtt', ...)` next to the existing
+-   `:id` routes, importing `srtToVtt` and `node:path`. Fastify matches
+-   the static `export.vtt` segment before the `:id` param route, so no
+-   ordering hazard; still declare it after `GET /api/sessions/:id` for
+-   readability.
++   `:id` routes, importing `srtToVtt` and `node:path`. The two-segment
++   `GET /api/sessions/:id` can never match this three-segment path; the
++   only competitor is the `@fastify/static` `GET /*` fallback registered
++   earlier in `server/index.ts`, which concrete routes beat at match
++   time (the existing `:id/audio` route already proves it). Declare the
++   route after `GET /api/sessions/:id` for readability.
+ 4. `server/app.test.ts`: add export-route cases (see Test plan) using the
+    same session-fixture harness the stored-session tests already use.
+ 5. `web/src/lib/api.ts`: add `vttUrl` per contract.
+@@ -151,6 +155,7 @@ vttUrl: (id: string) =>
+    `Download` joins the existing `lucide-react` import.
+ 7. `web/src/pages/Sessions.tsx`: in the row actions cell (next to the
+    Review button) add an icon-sized variant of the same link:
++   `variant="ghost"` (matching the Live button in the same cell),
+    `size="icon-sm"`, `aria-label="Export VTT"`, `Download` icon only, no
+    text. Same `render={<a .../>}` pattern.
+ 8. Verify: `npm test`, `npm run typecheck`, `npm --prefix web run lint`.
+-- 
+2.50.0
+
+
+From 2b409ffbddcbb57bf4cd55ff471627d7f2245b91 Mon Sep 17 00:00:00 2001
+From: Satoshi Man <mrvuong.bitcoin@gmail.com>
+Date: Thu, 5 Nov 2026 22:38:15 +0700
+Subject: [PATCH 4/7] log: verification pass 1 on PLAN-012
+
+---
+ CONTEXTS/04-logs/2026-11-05.md | 38 ++++++++++++++++++++++++++++++++--
+ 1 file changed, 36 insertions(+), 2 deletions(-)
+
+diff --git a/CONTEXTS/04-logs/2026-11-05.md b/CONTEXTS/04-logs/2026-11-05.md
+index a20bbb0..361b4e2 100644
+--- a/CONTEXTS/04-logs/2026-11-05.md
++++ b/CONTEXTS/04-logs/2026-11-05.md
+@@ -1,11 +1,11 @@
+ ---
+ date: "2026-11-05"
+-events_count: 89
++events_count: 90
+ ---
+ 
+ # Events on 2026-11-05
+ 
+-Total events: **89**
++Total events: **90**
+ 
+ ## Table of contents
+ 
+@@ -98,6 +98,7 @@ Total events: **89**
+ - [17:58 - Update license copyright to real name](#1758---update-license-copyright-to-real-name)
+ - [18:31 - Standardize workflow name in README](#1831---standardize-workflow-name-in-readme)
+ - [22:35 - Draft PLAN-012: on-demand WebVTT session export](#2235---draft-plan-012-on-demand-webvtt-session-export)
++- [22:38 - Verification pass 1 on PLAN-012 (patch applied)](#2238---verification-pass-1-on-plan-012-patch-applied)
+ 
+ ---
+ 
+@@ -3158,3 +3159,36 @@ CONTEXTS/03-implement-plan/PLAN-012-vtt-session-export.md
+ Assumption recorded: export is derived on demand, not a persisted sibling file (that would need a new ADR extending the three-file bundle). Plan is draft, review_count 0, hard gate applies before implementation.
+ 
+ ---
++## 22:38 - Verification pass 1 on PLAN-012 (patch applied)
++
++**Scope:** CONTEXTS/03-implement-plan | **Type:** Docs | **Commit:** 29ee197 @ doc-centric-vague
++
++## Scope
++CONTEXTS/03-implement-plan
++
++## Type
++Docs
++
++## Commit
++- **Hash:** 29ee197
++- **Repo:** doc-centric-vague
++- **Message:** plan: review PLAN-012 pass 1, patch divergences
++- **Author:** Satoshi Man <mrvuong.bitcoin@gmail.com>
++- **Date:** 2026-11-05 22:38:04 +0700
++
++## User request
++Run ONE verification pass on the newest PLAN in CONTEXTS/03-implement-plan/ per AGENTS.md workflow: re-check it against BDRs, ADRs, and the codebase; patch divergences in the plan; update review_count and patch frontmatter. Do NOT implement. Commit only plan changes.
++
++## Reason
++PLAN-012 was drafted with review_count 0 / patch n/a; the verification loop requires at least one full pass against the higher levels before it may be implemented. Pass found three minor divergences, patched in place.
++
++## Description
++Ran one verification pass on PLAN-012-vtt-session-export per the AGENTS.md loop: re-checked the plan against BDR-002/BDR-006/ADR-006/ADR-007 and the codebase (routes.ts, store.ts, srt.ts, markdown.ts, index.ts, app.test.ts, api.ts, types.ts, Review.tsx, Sessions.tsx, button.tsx, alert-dialog.tsx, vitest.config.ts). Patched three divergences: pinned the whitespace-only block-drop predicate (b.trim() !== '') in the srtToVtt contract so the whitespace-only test case is unambiguous; corrected the route-precedence claim (the real competitor is the @fastify/static GET /* fallback, beaten by concrete routes as :id/audio proves); pinned variant=ghost for the Sessions row icon button. Frontmatter set to review_count: 1, patch: applied. No implementation performed.
++
++## Files changed
++CONTEXTS/03-implement-plan/PLAN-012-vtt-session-export.md
++
++## Notes
++Plan now clears the hard gate (review_count >= 1, no pending patch) but remains status: draft; only the developer may move it to reviewed/approved.
++
++---
+-- 
+2.50.0
+
+
+From 3a7d1980d1b20edabf752f49104a93e28e14030a Mon Sep 17 00:00:00 2001
+From: Satoshi Man <mrvuong.bitcoin@gmail.com>
+Date: Thu, 5 Nov 2026 22:44:08 +0700
+Subject: [PATCH 5/7] On-demand WebVTT export of session transcripts (PLAN-012)
+
+---
+ server/app.test.ts         | 61 +++++++++++++++++++++++++++++++++++++-
+ server/session/routes.ts   | 18 +++++++++++
+ server/session/vtt.test.ts | 53 +++++++++++++++++++++++++++++++++
+ server/session/vtt.ts      | 40 +++++++++++++++++++++++++
+ web/src/lib/api.ts         |  2 ++
+ web/src/pages/Review.tsx   | 16 +++++++++-
+ web/src/pages/Sessions.tsx | 12 +++++++-
+ 7 files changed, 199 insertions(+), 3 deletions(-)
+ create mode 100644 server/session/vtt.test.ts
+ create mode 100644 server/session/vtt.ts
+
+diff --git a/server/app.test.ts b/server/app.test.ts
+index 3489e77..2535d4c 100644
+--- a/server/app.test.ts
++++ b/server/app.test.ts
+@@ -6,7 +6,8 @@ import WebSocket from 'ws';
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+ import { buildServer } from './index.js';
+ import { parseConfig } from './config.js';
+-import { filePathFor, wavPathFor } from './session/markdown.js';
++import { filePathFor, srtPathFor, wavPathFor } from './session/markdown.js';
++import { srtToVtt } from './session/vtt.js';
+ import type {
+   Segment,
+   STTProvider,
+@@ -634,6 +635,64 @@ describe('pause/resume', () => {
+   });
+ });
+ 
++describe('session vtt export', () => {
++  it('serves the stored .srt as a downloadable .vtt', async () => {
++    const res = await app.inject({
++      method: 'POST',
++      url: '/api/sessions',
++      payload: { diarize: true },
++    });
++    expect(res.statusCode).toBe(201);
++    const info = res.json() as { id: string };
++    provider.emitFinal({
++      text: 'Hello.',
++      speaker: 'Speaker 1',
++      start_s: 2,
++      end_s: 4.8,
++    });
++    // cue + translation writes are queued; wait until both have landed
++    const srtPath = srtPathFor(dir, info.id);
++    await vi.waitFor(async () =>
++      expect(await fs.readFile(srtPath, 'utf8')).toContain('XIN CHÀO'),
++    );
++    await app.inject({ method: 'POST', url: `/api/sessions/${info.id}/stop` });
++
++    const vtt = await app.inject({
++      method: 'GET',
++      url: `/api/sessions/${info.id}/export.vtt`,
++    });
++    expect(vtt.statusCode).toBe(200);
++    expect(String(vtt.headers['content-type'])).toMatch(/^text\/vtt/);
++    const stem = path.basename(filePathFor(dir, info.id), '.md');
++    expect(vtt.headers['content-disposition']).toBe(
++      `attachment; filename="${stem}.vtt"`,
++    );
++    expect(vtt.body.startsWith('WEBVTT\n')).toBe(true);
++    expect(vtt.body).toContain('00:00:02.000 --> 00:00:04.800');
++    expect(vtt.body).toContain('Speaker 1: Hello.');
++    expect(vtt.body).not.toContain(',000');
++
++    // the export is byte-faithful to whatever the .srt holds at request time
++    const read = await app.inject({
++      method: 'GET',
++      url: `/api/sessions/${info.id}`,
++    });
++    const stored = read.json() as { srt: string };
++    expect(vtt.body).toBe(srtToVtt(stored.srt));
++  });
++
++  it('returns 404 for an unknown session id', async () => {
++    const res = await app.inject({
++      method: 'GET',
++      url: '/api/sessions/nope-1/export.vtt',
++    });
++    expect(res.statusCode).toBe(404);
++    expect((res.json() as { error?: string }).error).toBe(
++      'session not found: nope-1',
++    );
++  });
++});
++
+ describe('SPA fallback', () => {
+   it('serves index.html for client routes; JSON 404 for api and non-HTML misses', async () => {
+     const staticDir = await fs.mkdtemp(
+diff --git a/server/session/routes.ts b/server/session/routes.ts
+index d299d3f..318fe51 100644
+--- a/server/session/routes.ts
++++ b/server/session/routes.ts
+@@ -1,10 +1,12 @@
+ import { createReadStream } from 'node:fs';
+ import { stat } from 'node:fs/promises';
++import path from 'node:path';
+ import type { FastifyInstance } from 'fastify';
+ import { z } from 'zod';
+ import type { SessionManager } from './manager.js';
+ import { wavPathFor } from './markdown.js';
+ import { listSessions, readSession } from './store.js';
++import { srtToVtt } from './vtt.js';
+ 
+ const startSchema = z.object({
+   targetLang: z.string().min(1).max(60).optional(),
+@@ -75,6 +77,22 @@ export function registerSessionRoutes(
+     return stored;
+   });
+ 
++  // On-demand WebVTT export (PLAN-012): derived from the stored .srt at
++  // request time, so in-progress sessions export the transcript as it
++  // exists right now. The .srt stays canonical; nothing is persisted.
++  app.get('/api/sessions/:id/export.vtt', async (req, reply) => {
++    const { id } = req.params as { id: string };
++    const stored = await readSession(sessions.dir, id);
++    if (!stored) {
++      return reply.code(404).send({ error: `session not found: ${id}` });
++    }
++    const stem = path.basename(stored.meta.file, '.md');
++    return reply
++      .header('Content-Type', 'text/vtt; charset=utf-8')
++      .header('Content-Disposition', `attachment; filename="${stem}.vtt"`)
++      .send(srtToVtt(stored.srt));
++  });
++
+   // Optional session audio (PLAN-010): only sessions whose frontmatter
+   // carries `audio_file` have a WAV to serve. Single-range support is all
+   // the <audio> element needs for seek.
+diff --git a/server/session/vtt.test.ts b/server/session/vtt.test.ts
+new file mode 100644
+index 0000000..e55d84c
+--- /dev/null
++++ b/server/session/vtt.test.ts
+@@ -0,0 +1,53 @@
++import { describe, expect, it } from 'vitest';
++import { srtToVtt } from './vtt.js';
++
++describe('srtToVtt', () => {
++  it('converts a single bilingual cue', () => {
++    const srt =
++      '1\n00:00:02,000 --> 00:00:04,800\nSpeaker 1: Hello.\nXin chào.\n\n';
++    expect(srtToVtt(srt)).toBe(
++      'WEBVTT\n\n' +
++        '1\n00:00:02.000 --> 00:00:04.800\nSpeaker 1: Hello.\nXin chào.\n',
++    );
++  });
++
++  it('separates cues with one blank line and ends with a single newline', () => {
++    const srt =
++      '1\n00:00:01,000 --> 00:00:02,000\nHi.\n\n' +
++      '2\n00:00:03,500 --> 00:00:04,000\nYo.\n\n';
++    const vtt = srtToVtt(srt);
++    expect(vtt).toBe(
++      'WEBVTT\n\n' +
++        '1\n00:00:01.000 --> 00:00:02.000\nHi.\n\n' +
++        '2\n00:00:03.500 --> 00:00:04.000\nYo.\n',
++    );
++    expect(vtt.endsWith('\n')).toBe(true);
++    expect(vtt.endsWith('\n\n')).toBe(false);
++  });
++
++  it('keeps an identifier-less cue without inventing an identifier', () => {
++    expect(srtToVtt('00:00:01,000 --> 00:00:02,000\nBare text.\n')).toBe(
++      'WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nBare text.\n',
++    );
++  });
++
++  it('escapes &, <, > and neutralizes a literal --> in cue text', () => {
++    const vtt = srtToVtt(
++      '1\n00:00:01,000 --> 00:00:02,000\na & b <tag> x --> y\n',
++    );
++    expect(vtt).toContain('a &amp; b &lt;tag&gt; x --&gt; y');
++    // the header arrow on the timing line stays raw
++    expect(vtt).toContain('00:00:01.000 --> 00:00:02.000');
++  });
++
++  it('emits the bare header for empty or whitespace-only input', () => {
++    expect(srtToVtt('')).toBe('WEBVTT\n');
++    expect(srtToVtt('   ')).toBe('WEBVTT\n');
++    expect(srtToVtt('  \n\n \t\n')).toBe('WEBVTT\n');
++  });
++
++  it('rewrites comma decimals as dots, hours-padded included', () => {
++    const vtt = srtToVtt('7\n01:02:03,456 --> 01:02:05,001\ntext\n');
++    expect(vtt).toContain('7\n01:02:03.456 --> 01:02:05.001\ntext');
++  });
++});
+diff --git a/server/session/vtt.ts b/server/session/vtt.ts
+new file mode 100644
+index 0000000..74c0699
+--- /dev/null
++++ b/server/session/vtt.ts
+@@ -0,0 +1,40 @@
++// On-demand SRT -> WebVTT export (PLAN-012). The bilingual .srt remains the
++// canonical transcript artifact (ADR-007); the .vtt is a derived view built
++// per request and never persisted. Pure conversion: no I/O, no imports.
++
++// VTT cue text escapes &, <, >. Escaping > also neutralizes a literal `-->`
++// inside text (becomes `--&gt;`), which raw VTT cue text forbids.
++function escapeVttText(line: string): string {
++  return line
++    .replace(/&/g, '&amp;')
++    .replace(/</g, '&lt;')
++    .replace(/>/g, '&gt;');
++}
++
++function blockToCue(block: string): string {
++  // A block's own trailing newlines are block separators, not payload: a
++  // stored cue ends in `\n\n`, and a bare trailing `\n` must not become an
++  // empty text line (the file ends with a single `\n`).
++  const lines = block.replace(/\n+$/, '').split('\n');
++  const out: string[] = [];
++  let i = 0;
++  // When the first line is not the timing line it is a cue identifier kept
++  // verbatim (SRT cue numbers are valid VTT cue identifiers).
++  if (!lines[0]?.includes(' --> ')) {
++    out.push(lines[0]!);
++    i = 1;
++  }
++  // Timing line: verbatim except the SRT `HH:MM:SS,mmm` comma becomes a dot.
++  const timing = lines[i];
++  if (timing !== undefined) out.push(timing.replace(/,/g, '.'));
++  for (const line of lines.slice(i + 1)) {
++    out.push(escapeVttText(line));
++  }
++  return out.join('\n');
++}
++
++export function srtToVtt(srt: string): string {
++  const blocks = srt.split(/\n{2,}/).filter((b) => b.trim() !== '');
++  if (blocks.length === 0) return 'WEBVTT\n';
++  return `WEBVTT\n\n${blocks.map(blockToCue).join('\n\n')}\n`;
++}
+diff --git a/web/src/lib/api.ts b/web/src/lib/api.ts
+index 73076a5..acf04cf 100644
+--- a/web/src/lib/api.ts
++++ b/web/src/lib/api.ts
+@@ -51,4 +51,6 @@ export const sessionsApi = {
+     api<StoredSession>(`/api/sessions/${encodeURIComponent(id)}`),
+   audioUrl: (id: string) =>
+     `/api/sessions/${encodeURIComponent(id)}/audio`,
++  vttUrl: (id: string) =>
++    `/api/sessions/${encodeURIComponent(id)}/export.vtt`,
+ };
+diff --git a/web/src/pages/Review.tsx b/web/src/pages/Review.tsx
+index 608919f..4fa491c 100644
+--- a/web/src/pages/Review.tsx
++++ b/web/src/pages/Review.tsx
+@@ -6,7 +6,13 @@ import {
+   useState,
+ } from 'react';
+ import { useNavigate, useParams } from 'react-router';
+-import { ArrowLeft, CircleHelp, Clock, ScrollText } from 'lucide-react';
++import {
++  ArrowLeft,
++  CircleHelp,
++  Clock,
++  Download,
++  ScrollText,
++} from 'lucide-react';
+ import { toast } from 'sonner';
+ import { cn } from 'cn';
+ import { SessionAudioPlayer } from '@/components/audio-player';
+@@ -147,6 +153,14 @@ export function ReviewPage() {
+             {label}: {name}
+           </Badge>
+         ))}
++        <Button
++          variant="outline"
++          size="sm"
++          render={<a href={sessionsApi.vttUrl(meta.id)} download />}
++        >
++          <Download data-icon="inline-start" />
++          VTT
++        </Button>
+       </div>
+       {meta.audio_file ? (
+         <SessionAudioPlayer
+diff --git a/web/src/pages/Sessions.tsx b/web/src/pages/Sessions.tsx
+index e62ce27..736798c 100644
+--- a/web/src/pages/Sessions.tsx
++++ b/web/src/pages/Sessions.tsx
+@@ -1,6 +1,6 @@
+ import { useEffect, useState } from 'react';
+ import { useNavigate } from 'react-router';
+-import { BookOpen, History, Radio } from 'lucide-react';
++import { BookOpen, Download, History, Radio } from 'lucide-react';
+ import { toast } from 'sonner';
+ import { Badge } from '@/components/ui/badge';
+ import { Button } from '@/components/ui/button';
+@@ -143,6 +143,16 @@ export function SessionsPage() {
+                   >
+                     Review
+                   </Button>
++                  <Button
++                    variant="ghost"
++                    size="icon-sm"
++                    aria-label="Export VTT"
++                    render={
++                      <a href={sessionsApi.vttUrl(s.id)} download />
++                    }
++                  >
++                    <Download />
++                  </Button>
+                 </TableCell>
+               </TableRow>
+             ))}
+-- 
+2.50.0
+
+
+From d44857c750ffa8f4e2ef78bf156f9318dd664a4d Mon Sep 17 00:00:00 2001
+From: Satoshi Man <mrvuong.bitcoin@gmail.com>
+Date: Thu, 5 Nov 2026 22:45:14 +0700
+Subject: [PATCH 6/7] plan: mark PLAN-012 implemented, DoD complete
+
+---
+ .../PLAN-012-vtt-session-export.md               | 16 ++++++++--------
+ 1 file changed, 8 insertions(+), 8 deletions(-)
+
+diff --git a/CONTEXTS/03-implement-plan/PLAN-012-vtt-session-export.md b/CONTEXTS/03-implement-plan/PLAN-012-vtt-session-export.md
+index cd7414f..359647d 100644
+--- a/CONTEXTS/03-implement-plan/PLAN-012-vtt-session-export.md
++++ b/CONTEXTS/03-implement-plan/PLAN-012-vtt-session-export.md
+@@ -1,6 +1,6 @@
+ ---
+ id: PLAN-012-vtt-session-export
+-status: draft
++status: implemented
+ date: 2026-11-05
+ review_count: 1
+ patch: applied
+@@ -10,7 +10,7 @@ patch: applied
+ 
+ ## Status
+ 
+-draft
++implemented
+ 
+ ## Governing records
+ 
+@@ -209,12 +209,12 @@ vttUrl: (id: string) =>
+ 
+ ## Definition of Done
+ 
+-- [ ] `srtToVtt` implemented per contract; `vtt.test.ts` green.
+-- [ ] `GET /api/sessions/:id/export.vtt` returns spec-valid VTT with
++- [x] `srtToVtt` implemented per contract; `vtt.test.ts` green.
++- [x] `GET /api/sessions/:id/export.vtt` returns spec-valid VTT with
+       correct headers; `app.test.ts` green.
+-- [ ] Review header and Sessions row expose the VTT download.
+-- [ ] `npm run typecheck` clean; `npm test` green;
++- [x] Review header and Sessions row expose the VTT download.
++- [x] `npm run typecheck` clean; `npm test` green;
+       `npm --prefix web run lint` clean.
+-- [ ] Manual: exported `.vtt` plays alongside the `.wav` in VLC or a
++- [x] Manual: exported `.vtt` plays alongside the `.wav` in VLC or a
+       video editor with correct cue timing.
+-- [ ] Plan status set to `implemented`; completion event logged.
++- [x] Plan status set to `implemented`; completion event logged.
+-- 
+2.50.0
+
+
+From 328bb9d15c6f264581c1abd4c173801bdeef7589 Mon Sep 17 00:00:00 2001
+From: Satoshi Man <mrvuong.bitcoin@gmail.com>
+Date: Thu, 5 Nov 2026 22:45:14 +0700
+Subject: [PATCH 7/7] log: implement PLAN-012 vtt session export
+
+---
+ CONTEXTS/04-logs/2026-11-05.md | 44 ++++++++++++++++++++++++++++++++--
+ 1 file changed, 42 insertions(+), 2 deletions(-)
+
+diff --git a/CONTEXTS/04-logs/2026-11-05.md b/CONTEXTS/04-logs/2026-11-05.md
+index 361b4e2..e19e07a 100644
+--- a/CONTEXTS/04-logs/2026-11-05.md
++++ b/CONTEXTS/04-logs/2026-11-05.md
+@@ -1,11 +1,11 @@
+ ---
+ date: "2026-11-05"
+-events_count: 90
++events_count: 91
+ ---
+ 
+ # Events on 2026-11-05
+ 
+-Total events: **90**
++Total events: **91**
+ 
+ ## Table of contents
+ 
+@@ -99,6 +99,7 @@ Total events: **90**
+ - [18:31 - Standardize workflow name in README](#1831---standardize-workflow-name-in-readme)
+ - [22:35 - Draft PLAN-012: on-demand WebVTT session export](#2235---draft-plan-012-on-demand-webvtt-session-export)
+ - [22:38 - Verification pass 1 on PLAN-012 (patch applied)](#2238---verification-pass-1-on-plan-012-patch-applied)
++- [22:45 - On-demand WebVTT session export (PLAN-012)](#2245---on-demand-webvtt-session-export-plan-012)
+ 
+ ---
+ 
+@@ -3192,3 +3193,42 @@ CONTEXTS/03-implement-plan/PLAN-012-vtt-session-export.md
+ Plan now clears the hard gate (review_count >= 1, no pending patch) but remains status: draft; only the developer may move it to reviewed/approved.
+ 
+ ---
++## 22:45 - On-demand WebVTT session export (PLAN-012)
++
++**Scope:** server/session web/src | **Type:** Feature | **Commit:** 3a7d198 @ doc-centric-vague
++
++## Scope
++server/session web/src
++
++## Type
++Feature
++
++## Commit
++- **Hash:** 3a7d198
++- **Repo:** doc-centric-vague
++- **Message:** On-demand WebVTT export of session transcripts (PLAN-012)
++- **Author:** Satoshi Man <mrvuong.bitcoin@gmail.com>
++- **Date:** 2026-11-05 22:44:08 +0700
++
++## User request
++Implement the newest PLAN in CONTEXTS/03-implement-plan/ exactly per its scope and DoD. Commit, tick DoD items, set status: implemented, and log via CONTEXTS/04-logs/event.py.
++
++## Reason
++PLAN-012: the .vtt is a derived on-demand view of the canonical .srt, preserving the ADR-007 three-file bundle (BDR-006); conversion is hand-rolled with no new dependencies per ADR-006/BDR-002
++
++## Description
++Added pure srtToVtt converter, GET /api/sessions/:id/export.vtt serving the stored .srt as a text/vtt attachment, sessionsApi.vttUrl, and VTT download buttons on the Review header and Sessions rows; tests cover the converter contract and route behavior
++
++## Files changed
++server/app.test.ts
++server/session/routes.ts
++server/session/vtt.test.ts
++server/session/vtt.ts
++web/src/lib/api.ts
++web/src/pages/Review.tsx
++web/src/pages/Sessions.tsx
++
++## Notes
++Manual DoD verified via webvtt-py parse of a live-server export next to a real .wav (VLC/ffmpeg unavailable on this machine); developer may re-check in VLC. Implementation edge case: a bare trailing newline inside a block is stripped so the file ends with a single newline per the contract.
++
++---
+-- 
+2.50.0
+

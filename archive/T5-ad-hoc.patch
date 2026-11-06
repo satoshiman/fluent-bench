@@ -1,0 +1,106 @@
+From 8a5c0348379fb44b5e4b255609e0d92a1b1e7d85 Mon Sep 17 00:00:00 2001
+From: bench <bench@local>
+Date: Thu, 5 Nov 2026 21:33:13 +0700
+Subject: [PATCH] bench: T5 output
+
+---
+ web/src/components/audio-player.tsx | 53 ++++++++++++++++++++++-------
+ 1 file changed, 40 insertions(+), 13 deletions(-)
+
+diff --git a/web/src/components/audio-player.tsx b/web/src/components/audio-player.tsx
+index 59d70ff..ee13b55 100644
+--- a/web/src/components/audio-player.tsx
++++ b/web/src/components/audio-player.tsx
+@@ -15,6 +15,14 @@ import {
+ } from 'lucide-react';
+ import { Button } from '@/components/ui/button';
+ import { Card, CardContent } from '@/components/ui/card';
++import {
++  Select,
++  SelectContent,
++  SelectGroup,
++  SelectItem,
++  SelectTrigger,
++  SelectValue,
++} from '@/components/ui/select';
+ import { cn } from 'cn';
+ 
+ function fmtTime(s: number): string {
+@@ -24,7 +32,7 @@ function fmtTime(s: number): string {
+   return `${m}:${String(t % 60).padStart(2, '0')}`;
+ }
+ 
+-const RATES = [1, 1.25, 1.5, 2];
++const RATES = [0.75, 1, 1.25, 1.5, 2];
+ const SKIP_S = 10;
+ 
+ interface SessionAudioPlayerProps {
+@@ -99,10 +107,9 @@ export function SessionAudioPlayer({
+     else a.pause();
+   };
+ 
+-  const cycleRate = () => {
+-    const a = audioRef.current;
+-    const next = RATES[(RATES.indexOf(rate) + 1) % RATES.length]!;
++  const changeRate = (next: number) => {
+     setRate(next);
++    const a = audioRef.current;
+     if (a) a.playbackRate = next;
+   };
+ 
+@@ -185,15 +192,31 @@ export function SessionAudioPlayer({
+               }}
+             />
+           </div>
+-          <Button
+-            variant="ghost"
+-            size="sm"
+-            className="h-7 w-10 shrink-0 px-0 font-mono text-xs tabular-nums"
+-            onClick={cycleRate}
+-            aria-label="Playback speed"
++          <Select
++            value={String(rate)}
++            onValueChange={(v) => changeRate(Number(v))}
+           >
+-            {rate}x
+-          </Button>
++            <SelectTrigger
++              size="sm"
++              aria-label="Playback speed"
++              className="h-7 w-auto shrink-0 gap-1 border-transparent px-1.5 font-mono text-xs tabular-nums shadow-none hover:bg-accent hover:text-accent-foreground dark:bg-transparent dark:hover:bg-accent/50"
++            >
++              <SelectValue />
++            </SelectTrigger>
++            <SelectContent>
++              <SelectGroup>
++                {RATES.map((r) => (
++                  <SelectItem
++                    key={r}
++                    value={String(r)}
++                    className="font-mono text-xs tabular-nums"
++                  >
++                    {r}x
++                  </SelectItem>
++                ))}
++              </SelectGroup>
++            </SelectContent>
++          </Select>
+           <Button
+             variant="ghost"
+             size="icon"
+@@ -224,7 +247,11 @@ export function SessionAudioPlayer({
+         onPlay={() => setPlaying(true)}
+         onPause={() => setPlaying(false)}
+         onEnded={() => setPlaying(false)}
+-        onLoadedMetadata={(e) => setDuration(e.currentTarget.duration)}
++        onLoadedMetadata={(e) => {
++          setDuration(e.currentTarget.duration);
++          // load() resets playbackRate; reapply the selected speed
++          e.currentTarget.playbackRate = rate;
++        }}
+         onDurationChange={(e) => setDuration(e.currentTarget.duration)}
+       />
+     </Card>
+-- 
+2.50.0
+

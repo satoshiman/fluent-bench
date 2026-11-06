@@ -1,0 +1,13 @@
+diff --git a/README.md b/README.md
+index 587fdf1..997d6dc 100644
+--- a/README.md
++++ b/README.md
+@@ -16,6 +16,8 @@ sent to the STT and LLM APIs you configure.
+   transcript review.
+ - Sessions stored as local Markdown files (frontmatter metadata) plus a
+   bilingual `.srt` export. No database.
++- WebVTT (`.vtt`) export for video tools, generated from the stored `.srt`:
++  `GET /api/sessions/:id/vtt` or the `.vtt` button on the review page.
+ - Answer-assist: LLM-generated suggested answers for interview-style
+   sessions.
+ - Cost: roughly $0.60-0.70 per audio hour on the default diarized path

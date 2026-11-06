@@ -1,0 +1,14 @@
+I'll start by exploring the codebase to understand the existing structure, especially the SRT export.Let me check the session manager and writer to understand how segments get persisted.Now I have the full picture. Sessions are stored as a `.md` + `.srt` bundle; `readSession` exposes the SRT via `stored.srt`. There's no existing `/export` route, so I'll add one that converts the stored SRT to WebVTT. Let me check the tsconfig for lib/target before writing.Now I'll implement. First, the VTT conversion module:Now the export route in `routes.ts`:Now add endpoint tests in `app.test.ts` and a unit test for the converter:Now run typecheck and the test suite:Two failures in `pause/resume` tests — possibly flaky timing tests. Let me check the full output and whether my new tests passed:The two failures are pre-existing timing flakes unrelated to my change: the lifecycle test's `00:00:01,001` vs `00:00:01,000` ms-rounding race, and a `waitFor` timeout in pause/resume. My export tests passed. But the first flake is exactly what my exact-match body assertion could hit too, so I'll make my test derive expectations from the stored SRT instead of hardcoding timestamps:Now re-run the suite to check whether the two failures were just flakes:All green: `npm test` (151 tests) and `npm run typecheck` pass. The two failures in the earlier run were pre-existing timing flakes (a 1ms `streamBaseS` rounding race and a `waitFor` timeout), not related to this change — they passed on rerun.
+
+## What I added
+
+**`server/session/vtt.ts`** — `srtToVtt(srt)` renders the stored bilingual `.srt` artifact as WebVTT: prepends the `WEBVTT` header and rewrites each cue's timing line from `HH:MM:SS,mmm` to `HH:MM:SS.mmm`. Cue text lines (source + translation) pass through verbatim, and the SRT cue counter is kept as the optional WebVTT cue identifier. [vtt.ts](file://~/fluent-bench/runs/T1/ad-hoc/server/session/vtt.ts)
+
+**`GET /api/sessions/:id/export`** in `routes.ts`:
+- `format=vtt` → `Content-Type: text/vtt`, `Content-Disposition: attachment; filename="<session-id>.vtt"` (id sanitized for header safety)
+- missing/unsupported `format` → 400 (checked before the session lookup)
+- unknown session id → 404 [routes.ts:79-98](file://~/fluent-bench/runs/T1/ad-hoc/server/session/routes.ts)
+
+**Tests** — new `describe('session export')` block in `app.test.ts` covering the happy path (real session lifecycle → valid VTT output identical to the stored SRT modulo timestamp separator), 404, and 400 for both bad and missing `format`; plus `vtt.test.ts` unit tests for the converter.
+
+One note: the happy-path test asserts the regex-pinned timestamp format rather than exact ms values, since `streamBaseS` makes the milliseconds nondeterministic — the same flake that intermittently hits the existing lifecycle test.

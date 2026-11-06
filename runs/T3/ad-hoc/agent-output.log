@@ -1,0 +1,26 @@
+I'll start by exploring the workspace to understand the project structure.Now let me look at the remaining relevant files: tests, config, and how sessions get exercised.Let me look at the remaining pieces: `index.ts`, `routes.ts`, `config.ts`, and how the web client handles error events.Let me check `vitest.config.ts`, `tsconfig.json`, and the session routes briefly.I have the full picture. Design: a `withReconnect` provider wrapper (mirroring `withIdleTimeout`), so both providers get reconnect for free and it can be covered with mocked sockets.
+
+Plan:
+- `server/stt/provider.ts`: add optional `onReconnected` to `StreamEvents`.
+- New `server/stt/reconnect.ts`: `withReconnect(provider, opts)` — buffers audio while the inner stream is down, retries up to 5 times on unexpected close/error with exponential backoff (1s base, doubling, jitter), emits `SttReconnectError` + `onClose` on exhaustion, deliberate `close()` never retries.
+- `server/stt/index.ts`: wrap both providers.
+- `server/session/manager.ts`: recompute `streamBaseS` on `onReconnected` (timestamps stay cumulative), propagate error `code` on broadcast.
+- Tests: new `server/stt/reconnect.test.ts` using `DeepgramProvider` + `FakeDgSocket`, plus integration cases in `app.test.ts`.Now update `provider.ts` and `stt/index.ts`:Now update `manager.ts` — extract the elapsed-time calc, add `onReconnected`, propagate error `code`:Now the test file covering reconnect with a mocked socket:The last test is incomplete — I need to capture the inner events to simulate a drop. Fixing it:Now add integration coverage in `app.test.ts`. First check the imports block and add what's needed:Typecheck passes. Running tests:The initial WS handshake sends `session: idle` before the session starts — my assertion needs to check the *latest* session state, not the presence of any idle event.The exhaustion test has the same flaw — the initial `idle` message makes that assertion trivially true. Let me make it check for an idle *after* the error:All 157 tests pass. Re-running typecheck since I edited test files after the first check:Done. `npm test` (157 tests) and `npm run typecheck` both pass.
+
+## What I built
+
+Reconnection lives in a new provider wrapper, `server/stt/reconnect.ts`, mirroring the existing `withIdleTimeout` pattern so both providers get it for free:
+
+- **`withReconnect(provider, opts)`** wraps `STTProvider.start_stream` and manages the inner stream lifecycle:
+  - Unexpected `close` or `error` on the inner stream → schedules a reopen with exponential backoff: base 1s, doubling per attempt, capped at 30s, jittered to `[0.5x, 1x]` of the backoff.
+  - Up to 5 reconnect attempts per drop; attempt count resets only after the new stream stays up for 15s (a flapping link still exhausts rather than retrying forever).
+  - Audio sent while disconnected goes into a bounded buffer (256 chunks) and is flushed in order onto the new stream before `onReconnected` fires.
+  - Exhaustion emits `SttReconnectError` (`code: 'STT_RECONNECT_FAILED'`) then `onClose`; deliberate `close()` cancels timers/buffer and never retries, even mid-backoff.
+- **`server/stt/provider.ts`**: added optional `onReconnected` to `StreamEvents`.
+- **`server/stt/index.ts`**: providers are now `withIdleTimeout(withReconnect(p))` — the idle timeout sits outside so the client's audio cadence (including buffered sends) is what counts as "not idle".
+- **`server/session/manager.ts`**: extracted `streamBaseSNow()` and re-anchor `streamBaseS` in `onReconnected` so segment/SRT timestamps stay cumulative across a socket swap; `handleSttError` now propagates `err.code` through the existing `{type:'error'}` broadcast, which the web client already toasts.
+
+## Tests
+
+- `server/stt/reconnect.test.ts` — drives `DeepgramProvider` through the wrapper with `FakeDgSocket` (no network, injected `connectFn`): drop → reopen + resume, buffered-audio flush, error-triggered reconnect, no reconnect on deliberate close or mid-backoff close, exponential backoff timing via fake timers, and `STT_RECONNECT_FAILED` after 5 attempts (6 total opens).
+- `server/app.test.ts` — end-to-end via `providerFactory: () => withReconnect(fakeProvider, {baseDelayMs: 5})`: session stays `active` through a drop with buffered audio flushed and rebased timestamps; exhaustion surfaces `STT_RECONNECT_FAILED` then ends the session; deliberate stop triggers no reconnect.

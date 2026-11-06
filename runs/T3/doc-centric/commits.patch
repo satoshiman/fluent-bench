@@ -1,0 +1,1442 @@
+From 76eac846ad602b02448ba8c6d9b9ad880f9d7492 Mon Sep 17 00:00:00 2001
+From: Satoshi Man <mrvuong.bitcoin@gmail.com>
+Date: Thu, 5 Nov 2026 21:01:24 +0700
+Subject: [PATCH 1/5] plan: draft PLAN-012 STT stream reconnect
+
+---
+ .../PLAN-012-stt-stream-reconnect.md          | 371 ++++++++++++++++++
+ 1 file changed, 371 insertions(+)
+ create mode 100644 CONTEXTS/03-implement-plan/PLAN-012-stt-stream-reconnect.md
+
+diff --git a/CONTEXTS/03-implement-plan/PLAN-012-stt-stream-reconnect.md b/CONTEXTS/03-implement-plan/PLAN-012-stt-stream-reconnect.md
+new file mode 100644
+index 0000000..793eb17
+--- /dev/null
++++ b/CONTEXTS/03-implement-plan/PLAN-012-stt-stream-reconnect.md
+@@ -0,0 +1,371 @@
++---
++id: PLAN-012-stt-stream-reconnect
++status: draft
++date: 2026-11-05
++review_count: 0
++patch: n/a
++---
++
++# PLAN-012: Automatic reconnection for dropped STT provider sockets
++
++## Status
++
++draft
++
++## Context
++
++When the provider-side streaming socket (Deepgram or AssemblyAI) drops
++mid-session, the provider fires `onClose`, and `SessionManager.openStream`
++treats any non-paused, non-stopping close as fatal: it calls `finish(active)`
++and the transcription stream is lost for the rest of the session. The task:
++reconnect transparently up to 5 times with exponential backoff, buffer and
++flush audio across the gap, keep deliberate stop/shutdown from reconnecting,
++and surface a clear error through the existing event channel only after
++retries are exhausted.
++
++The codebase already composes cross-cutting stream behavior with provider
++decorators (`withIdleTimeout` in `server/stt/idle-timeout.ts`, applied in
++`createSTTProvider`), so reconnection is implemented the same way rather
++than inside `SessionManager` or duplicated per provider.
++
++## Governing records
++
++- ADR-002: STT is consumed only through the provider interface
++  (`start_stream` / `send_audio` / events); no provider SDK types leak into
++  application code. Reconnect therefore lives in a decorator over
++  `STTProvider`, not in manager or socket code. Billing hygiene: deepgram
++  bills per audio second, AssemblyAI per socket-open duration, so the
++  reconnect window must stay bounded (5 attempts, capped pending buffer,
++  existing idle timeout stays outermost).
++- ADR-006: no new dependencies; the decorator is plain TypeScript over the
++  existing interfaces, tests use vitest fake timers plus the existing
++  fake-socket harnesses.
++- BDR-001: real-time output is the product; reconnecting instead of ending
++  the session directly serves the real-time requirement.
++- BDR-002: cost ceiling; a bounded retry window plus the unchanged idle
++  timeout keep billed socket time proportional to real audio.
++
++## Scope
++
++In scope:
++
++1. `server/stt/reconnect.ts` (new): `withReconnect` provider decorator and
++   `SttReconnectError`.
++2. `server/stt/provider.ts`: one optional event added to `StreamEvents`.
++3. `server/stt/index.ts`: compose `withReconnect` inside `withIdleTimeout`
++   for both providers.
++4. `server/session/manager.ts`: rebase `streamBaseS` on reconnect via the
++   new event; pass `code` through on broadcast errors.
++5. `server/stt/reconnect.test.ts` (new): unit tests over a scripted inner
++   provider plus real providers driven by injected fake sockets.
++
++Out of scope:
++
++- Client-facing `/ws` resilience: `use-live-session.ts` already retries the
++  browser socket; unchanged.
++- Frontend changes of any kind. The exhausted-retry error travels the
++  existing `{ type: 'error' }` broadcast and lands in the existing toast.
++- Making retry parameters configurable via env (constants for now; see
++  Risks).
++- Mid-word partial recovery, sequence numbers, or gap-aware timestamp
++  repair (see Risks: buffered burst approximation).
++- Reconnect for the initial `start_stream` call: a first-connect failure
++  still rejects session start exactly as today.
++
++## Design decisions (pinned)
++
++### Decorator contract (`server/stt/reconnect.ts`, literal)
++
++```ts
++export interface ReconnectOptions {
++  maxAttempts?: number;      // default 5
++  baseDelayMs?: number;      // default 1000
++  stableMs?: number;         // default 5000
++  maxPendingChunks?: number; // default 512
++  random?: () => number;     // default Math.random; injected for tests
++}
++
++export class SttReconnectError extends Error {
++  readonly code = 'STT_RECONNECT_FAILED';
++  readonly attempts: number;
++  constructor(attempts: number, cause?: Error);
++}
++
++export function withReconnect(
++  provider: STTProvider,
++  opts?: ReconnectOptions,
++): STTProvider;
++```
++
++`SttReconnectError` message literal:
++`STT stream lost; reconnect failed after ${attempts} attempts`, with
++`cause` set to the last inner error when one exists. `name` is
++`'SttReconnectError'`.
++
++`withReconnect` returns an object exposing `name` and
++`supports_diarization` forwarded from the inner provider; `start_stream`
++returns an `STTStream` whose lifecycle is described below.
++
++### Event contract (`server/stt/provider.ts`, literal)
++
++```ts
++export interface StreamEvents {
++  onPartial(seg: Segment): void;
++  onFinal(seg: Segment): void;
++  onError(err: Error): void;
++  onClose?(): void;
++  onReconnect?(): void; // NEW: fired once per successful reconnection
++}
++```
++
++Optional field: existing providers, tests, and `withIdleTimeout` compile
++unchanged. `withIdleTimeout` spreads `...events` when wrapping, so
++`onReconnect` passes through it with no edit.
++
++### Stream state machine (per `start_stream` call)
++
++All state lives in the closure of one `start_stream` invocation; a new
++manager-level `openStream` (pause/resume, session start) gets fresh state.
++
++- `deliberate: boolean` starts false; `inner: STTStream | null`;
++  `pending: Buffer[]`; `attempts: number` (reconnect attempts made for the
++  current incident); `timer` for the pending attempt; `openedAt: number`
++  timestamp of the last healthy stream; `lastError: Error | undefined`;
++  `exhausted: boolean`.
++- The inner provider is started with wrapped events:
++  `onPartial`/`onFinal` forward straight through.
++- Inner `onError(err)`: store as `lastError`. If `deliberate`, forward to
++  `events.onError`. Otherwise treat exactly like an unexpected close:
++  call `inner.close()` to normalize (wrapped in try/catch) and enter the
++  reconnect flow. Rationale: requirement says "close or error"; `ws` and
++  the Deepgram SDK both emit `error` before `close`, and holding the error
++  (not forwarding it) means transient failures never reach the client
++  unless retries exhaust.
++- Inner `onClose()`: if `deliberate`, forward `events.onClose?.()`.
++  Otherwise enter the reconnect flow.
++- Reconnect flow: if the just-lost stream survived `>= stableMs`
++  (`Date.now() - openedAt >= stableMs`), reset `attempts` to 0 first (a new
++  incident). Then `scheduleAttempt()`.
++- `scheduleAttempt()`: if `attempts >= maxAttempts`, set `exhausted`,
++  emit `events.onError(new SttReconnectError(attempts, lastError))` then
++  `events.onClose?.()`, and stop. Otherwise increment `attempts` and set
++  `timer = setTimeout(connect, delayFor(attempts))`.
++- Delay formula (literal): for attempt `n` (1-based),
++  `delayFor(n) = baseDelayMs * 2 ** (n - 1) * random()` - full jitter over
++  [0, 1s/2s/4s/8s/16s) for the default base. Injected `random` makes tests
++  deterministic.
++- `connect()`: `provider.start_stream(opts, wrappedEvents)` again. On
++  resolve: assign `inner`, set `openedAt`, flush `pending` in order
++  through `inner.send_audio` (each call try/catch; a throw stops the flush
++  and leaves the rest queued... no: pin it - a throw stops the flush and
++  the remaining chunks are discarded, since the provider contract expects
++  `send_audio` not to throw and a throwing fresh stream is itself
++  unhealthy), then fire `events.onReconnect?.()`. On reject: store the
++  rejection as `lastError` and call `scheduleAttempt()` again (the reject
++  counts toward the same `attempts` budget; no `onClose` event is
++  involved).
++- Outer `send_audio(chunk)`: if `deliberate` or `exhausted`, drop
++  silently. If `inner` is null (mid-backoff or mid-connect), push to
++  `pending`; when `pending` is at `maxPendingChunks`, drop the oldest
++  chunk (FIFO shift) to bound memory. Otherwise forward to
++  `inner.send_audio` inside try/catch (provider contract says no throw,
++  but stay safe like `withIdleTimeout` does).
++- Outer `close()`: set `deliberate`, clear `timer`, clear `pending`, call
++  `inner?.close()` in try/catch. If no `onClose` has been forwarded yet,
++  forward `events.onClose?.()` once, so `close()` still produces the
++  close signal callers see today even when the socket was already dead or
++  a backoff was pending.
++
++The `stableMs` reset prevents infinite flap: a socket that dies within 5s
++of opening continues the same incident and burns the retry budget, while a
++long-lived stream that drops starts a fresh 5-attempt budget.
++
++### Composition order (`server/stt/index.ts`, literal shape)
++
++```ts
++return withIdleTimeout(
++  withReconnect(new AssemblyAIProvider(config.ASSEMBLYAI_API_KEY)),
++  config.STT_IDLE_TIMEOUT_S,
++);
++// and likewise withReconnect(new DeepgramProvider(config.DEEPGRAM_API_KEY))
++```
++
++`withReconnect` MUST be innermost. The idle decorator's timeout fires
++`events.onError(IdleTimeoutError)` and then closes its inner stream; if
++the reconnect wrapper sat outside, that deliberate inner close would read
++as an unexpected drop and resurrect the stream, silently defeating the
++idle timeout. With idle outermost, its `close()` reaches the wrapper's
++`close()`, which sets `deliberate` and never reconnects. During a backoff
++gap, incoming audio still flows through idle's `send_audio` (resetting its
++timer) into the wrapper's pending buffer, so continuous speech does not
++idle-kill a session mid-reconnect; a genuinely silent 30s gap can still
++time out, which is consistent with billing hygiene.
++
++### Manager changes (`server/session/manager.ts`)
++
++- Extract the existing openStream base computation into
++  `private unpausedElapsedS(active: ActiveSession): number` (the exact
++  expression already inline in `openStream`), use it at openStream entry,
++  and reuse it for the rebase below.
++- `openStream` events gain
++  `onReconnect: () => { active.streamBaseS = this.unpausedElapsedS(active); }`.
++  Provider timestamps restart at 0 on each new socket; without the rebase,
++  `[mm:ss]` tags would regress mid-session. With it, post-reconnect
++  segments continue at wall-clock session time (the gap-burst caveat is in
++  Risks).
++- `handleSttError`: after the `IdleTimeoutError` branch, broadcast with a
++  code passthrough:
++  `{ type: 'error', message: err.message, ...(((err as { code?: string }).code) ? { code: (err as { code?: string }).code } : {}) }`
++  so `STT_RECONNECT_FAILED` reaches the client as a coded error event.
++- The `onClose` handler (`finish` on unexpected close) is unchanged: with
++  the wrapper, the manager only sees `onClose` for deliberate closes
++  (ignored via `stopping`/`paused`) or after retry exhaustion (finishes
++  the session, which is correct once the stream is unrecoverable).
++
++### Why a decorator, not manager-side reconnect (recorded decision)
++
++Manager-side retry would reuse `openStream` and get `streamBaseS` for
++free, but it pushes retry timers, pending buffers, and attempt state into
++an already-large `ActiveSession`, duplicates what `withIdleTimeout` proves
++is the codebase's composition style, and is harder to cover with the
++required mocked-socket tests. The decorator needs only the optional
++`onReconnect` event added to the contract.
++
++## Steps
++
++### Step 1 - `server/stt/provider.ts`
++
++Add `onReconnect?(): void` to `StreamEvents` (literal above). No other
++change; the contract harness in `contract.ts` is untouched.
++
++### Step 2 - `server/stt/reconnect.ts` (new)
++
++Implement `SttReconnectError`, `ReconnectOptions`, and `withReconnect`
++per the pinned state machine, delay formula, buffer bounds, and event
++semantics above. Defaults: `maxAttempts` 5, `baseDelayMs` 1000,
++`stableMs` 5000, `maxPendingChunks` 512, `random` = `Math.random`.
++
++### Step 3 - `server/stt/index.ts`
++
++Wrap both provider constructions in `withReconnect` inside
++`withIdleTimeout` (literal shape above).
++
++### Step 4 - `server/session/manager.ts`
++
++Extract `unpausedElapsedS`, add the `onReconnect` handler in `openStream`,
++add the `code` passthrough in `handleSttError`. No new fields on
++`ActiveSession`; no change to `sendAudio`, `pause`, `resume`, `stop`,
++`finish`.
++
++### Step 5 - `server/stt/reconnect.test.ts` (new)
++
++Cases listed in the test plan below.
++
++## Test plan
++
++Automated (vitest), all offline - provider keys are test strings and every
++socket is a fake injected through `connectFn`/`wsFactory` or a scripted
++inner provider:
++
++- Scripted inner provider (a FakeProvider in the `idle-timeout.test.ts`
++  style, extended to capture `events` and expose `startCount`, scripted to
++  let the test emit `close`/`error`/`open` and to reject `start_stream` on
++  demand), wrapped in `withReconnect`:
++  - unexpected `close` triggers exactly one `start_stream` retry;
++    `onClose` is NOT forwarded to outer events on transient drops.
++  - `vi.useFakeTimers()` with `random: () => 0.5`: attempts land at 0.5,
++    1, 2, 4, 8s after each failure (delay = base * 2^(n-1) * 0.5); a 6th
++    attempt is never made.
++  - after 5 failed attempts: outer `onError` receives an
++    `SttReconnectError` with `code === 'STT_RECONNECT_FAILED'`, then outer
++    `onClose` fires once.
++  - audio sent while `inner` is null is buffered and flushed in order to
++    the replacement stream; buffer overflow drops oldest, not newest.
++  - outer `close()` during backoff: timer cleared, no further
++    `start_stream` calls, `onClose` forwarded once. `close()` after
++    exhaustion is a no-op beyond the single forwarded close.
++  - a stream surviving `>= stableMs` before dropping resets the attempt
++    budget (drop -> 5s+ open -> drop starts a fresh attempt 1).
++  - a rejected `start_stream` during reconnect consumes an attempt and
++    reschedules; outer `onError` is not called until exhaustion.
++- Mocked-socket coverage through the real providers (literal "mocked
++  socket" requirement, zero network):
++  - `withReconnect(new DeepgramProvider('test-key', connectFn))` where
++    `connectFn` resolves successive `FakeDgSocket`s: socket1 `emit('close')`
++    mid-stream -> `connectFn` called again -> buffered audio flushes to
++    socket2's `sendMedia` on its `open`.
++  - `withReconnect(new AssemblyAIProvider('test-key', wsFactory))` with a
++    `FakeWs` sequence: first socket `emit('close')` -> factory called
++    again -> second socket `emit('open')` -> pending audio flushes via
++    `send`.
++- `server/app.test.ts`: no changes required; the injected
++  `providerFactory` bypasses `createSTTProvider`, so the existing
++  FakeProvider keeps its current "unexpected close finishes the session"
++  semantics. Optionally add one regression test later; not part of this
++  plan's DoD.
++- Gates: `npm test` and `npm run typecheck` (the task's stated gates).
++
++Manual acceptance (post-implementation, needs real keys; not a DoD gate):
++
++- Start a session on Deepgram, kill outbound connectivity ~10s, restore:
++  transcription resumes, `[mm:ss]` tags do not regress, no error toast.
++- Stop during a forced outage: session ends immediately, no reconnect
++  attempts in logs.
++- With connectivity dead past ~31s of backoff: a single error toast
++  (`STT_RECONNECT_FAILED`) and the session ends.
++
++## Risks and notes
++
++- **Assumption: decorator layer.** "The STT websocket" is read as the
++  provider-side socket inside the `STTProvider` abstraction; the
++  client-facing `/ws` socket already retries in `use-live-session.ts`.
++- **Assumption: error == drop.** Any inner `onError` triggers the
++  reconnect flow, per the requirement's "close or error". Neither current
++  adapter emits recoverable-only errors, so no false-positive churn is
++  expected; if a provider later adds non-fatal warnings, this rule may
++  need a severity check.
++- **Buffered burst skews timestamps.** Audio captured during the gap is
++  flushed as a burst; the provider stamps it with post-open stream time,
++  so those segments compress the gap. `streamBaseS` rebase keeps later
++  segments monotonic; exact gap-aware timing needs sequence numbers, out
++  of scope.
++- **Silent-gap idle race.** Max backoff sum is ~31s worst case (~15.5s
++  average under full jitter). A reconnect gap with zero audio can hit the
++  30s idle timeout first and end the session with `IDLE_TIMEOUT`. Accepted
++  as billing hygiene (ADR-002): no billable stream exists during the gap
++  anyway, and speech resets the timer.
++- **Constants, not config.** Retry parameters are constructor-injectable
++  constants, not env vars - proportional documentation for a single-site
++  policy. Promote to `Config` only if operators ask for tuning.
++- **Buffer bound.** 512 chunks is a rough bound (at the worklet's
++  ~20-100ms cadence it covers more than the worst-case backoff window);
++  overflow drops oldest so a long outage loses the earliest gap audio
++  rather than unbounded memory.
++- **First connect is not retried.** `start_stream` rejection on session
++  start still fails the start - deliberate, since a dead provider at t=0
++  is a config/credential problem the user should see immediately.
++- **No frontend change.** The client already renders `{type:'error'}`
++  broadcasts as toasts; `STT_RECONNECT_FAILED` flows through the same
++  channel.
++
++## Definition of Done
++
++- [ ] `withReconnect` in `server/stt/reconnect.ts` implements the pinned
++      state machine: unexpected close/error schedules up to 5 retries at
++      `baseDelayMs * 2^(n-1) * random()`; `stableMs` resets the incident
++      budget; pending audio is bounded at `maxPendingChunks` (drop-oldest)
++      and flushed in order on the replacement stream; `onReconnect` fires
++      after a successful reconnect.
++- [ ] Deliberate `close()` (including pause/stop/shutdown paths) cancels
++      any pending retry and never reconnects.
++- [ ] After 5 failed attempts the outer events see one
++      `SttReconnectError` (`code: 'STT_RECONNECT_FAILED'`) followed by one
++      `onClose`, which ends the session through the existing manager path.
++- [ ] `StreamEvents.onReconnect` added; `createSTTProvider` composes
++      `withIdleTimeout(withReconnect(provider))` for both providers.
++- [ ] Manager rebases `streamBaseS` on `onReconnect` and forwards `code`
++      on error broadcasts.
++- [ ] `server/stt/reconnect.test.ts` covers every case in the test plan
++      using scripted inner providers and injected fake sockets only; no
++      test touches the real network or real provider keys.
++- [ ] `npm test` and `npm run typecheck` pass.
+-- 
+2.50.0
+
+
+From a3d9abcd0d2646e88b6bd8252da8c6752793611e Mon Sep 17 00:00:00 2001
+From: Satoshi Man <mrvuong.bitcoin@gmail.com>
+Date: Thu, 5 Nov 2026 21:06:24 +0700
+Subject: [PATCH 2/5] plan: review PLAN-012 pass 1, patch reconnect state
+ machine divergences
+
+---
+ .../PLAN-012-stt-stream-reconnect.md          | 85 +++++++++++++------
+ 1 file changed, 57 insertions(+), 28 deletions(-)
+
+diff --git a/CONTEXTS/03-implement-plan/PLAN-012-stt-stream-reconnect.md b/CONTEXTS/03-implement-plan/PLAN-012-stt-stream-reconnect.md
+index 793eb17..aaee918 100644
+--- a/CONTEXTS/03-implement-plan/PLAN-012-stt-stream-reconnect.md
++++ b/CONTEXTS/03-implement-plan/PLAN-012-stt-stream-reconnect.md
+@@ -2,8 +2,8 @@
+ id: PLAN-012-stt-stream-reconnect
+ status: draft
+ date: 2026-11-05
+-review_count: 0
+-patch: n/a
++review_count: 1
++patch: applied
+ ---
+ 
+ # PLAN-012: Automatic reconnection for dropped STT provider sockets
+@@ -130,51 +130,68 @@ manager-level `openStream` (pause/resume, session start) gets fresh state.
+ - `deliberate: boolean` starts false; `inner: STTStream | null`;
+   `pending: Buffer[]`; `attempts: number` (reconnect attempts made for the
+   current incident); `timer` for the pending attempt; `openedAt: number`
+-  timestamp of the last healthy stream; `lastError: Error | undefined`;
+-  `exhausted: boolean`.
++  timestamp of the last healthy stream (set when the initial
++  `start_stream` resolves and again on every successful reconnect);
++  `lastError: Error | undefined`; `exhausted: boolean`;
++  `recovering: boolean` (reconnect flow in flight);
++  `closeForwarded: boolean` (outer `onClose` already emitted - every
++  `events.onClose?.()` call below goes through this guard so it fires at
++  most once).
+ - The inner provider is started with wrapped events:
+   `onPartial`/`onFinal` forward straight through.
+ - Inner `onError(err)`: store as `lastError`. If `deliberate`, forward to
+-  `events.onError`. Otherwise treat exactly like an unexpected close:
+-  call `inner.close()` to normalize (wrapped in try/catch) and enter the
+-  reconnect flow. Rationale: requirement says "close or error"; `ws` and
+-  the Deepgram SDK both emit `error` before `close`, and holding the error
+-  (not forwarding it) means transient failures never reach the client
+-  unless retries exhaust.
+-- Inner `onClose()`: if `deliberate`, forward `events.onClose?.()`.
+-  Otherwise enter the reconnect flow.
++  `events.onError`. If `recovering` or `exhausted`, ignore (a dying socket
++  must not schedule a second attempt). Otherwise treat exactly like an
++  unexpected close: set `recovering`, move `inner` into a local and null
++  the field BEFORE calling `inner.close()` to normalize (wrapped in
++  try/catch), then run the reconnect flow. Rationale: requirement says
++  "close or error"; `ws` and the Deepgram SDK both emit `error` before
++  `close`, and holding the error (not forwarding it) means transient
++  failures never reach the client unless retries exhaust. The
++  flag-then-clear-then-close order is pinned because `close` can be
++  emitted synchronously from `close()` (both repo fake sockets do this) or
++  asynchronously (real `ws`): either way a re-entrant `onClose` sees
++  `recovering` already set and does not double-schedule.
++- Inner `onClose()`: if `deliberate`, forward `events.onClose?.()` via the
++  `closeForwarded` guard. If `recovering` or `exhausted`, ignore.
++  Otherwise set `recovering`, null `inner` (after keeping a local ref),
++  and run the reconnect flow.
+ - Reconnect flow: if the just-lost stream survived `>= stableMs`
+   (`Date.now() - openedAt >= stableMs`), reset `attempts` to 0 first (a new
+   incident). Then `scheduleAttempt()`.
+ - `scheduleAttempt()`: if `attempts >= maxAttempts`, set `exhausted`,
+-  emit `events.onError(new SttReconnectError(attempts, lastError))` then
+-  `events.onClose?.()`, and stop. Otherwise increment `attempts` and set
++  clear `recovering`, close the dead `inner` best-effort (try/catch), emit
++  `events.onError(new SttReconnectError(attempts, lastError))` then
++  `events.onClose?.()` via the `closeForwarded` guard, and stop. Otherwise
++  increment `attempts` and set
+   `timer = setTimeout(connect, delayFor(attempts))`.
+ - Delay formula (literal): for attempt `n` (1-based),
+   `delayFor(n) = baseDelayMs * 2 ** (n - 1) * random()` - full jitter over
+   [0, 1s/2s/4s/8s/16s) for the default base. Injected `random` makes tests
+   deterministic.
+ - `connect()`: `provider.start_stream(opts, wrappedEvents)` again. On
+-  resolve: assign `inner`, set `openedAt`, flush `pending` in order
+-  through `inner.send_audio` (each call try/catch; a throw stops the flush
+-  and leaves the rest queued... no: pin it - a throw stops the flush and
+-  the remaining chunks are discarded, since the provider contract expects
+-  `send_audio` not to throw and a throwing fresh stream is itself
+-  unhealthy), then fire `events.onReconnect?.()`. On reject: store the
+-  rejection as `lastError` and call `scheduleAttempt()` again (the reject
+-  counts toward the same `attempts` budget; no `onClose` event is
+-  involved).
++  resolve: if `deliberate` was set while the connect was in flight, close
++  the fresh stream (try/catch) and drop it instead of assigning `inner` -
++  a socket opened after a user stop is billable and must not leak.
++  Otherwise assign `inner`, clear `recovering`, set `openedAt`, flush
++  `pending` in order through `inner.send_audio` (each call try/catch; a
++  throw stops the flush and the remaining chunks are discarded, since the
++  provider contract expects `send_audio` not to throw and a throwing fresh
++  stream is itself unhealthy), then fire `events.onReconnect?.()`. On
++  reject: store the rejection as `lastError` and call `scheduleAttempt()`
++  again (the reject counts toward the same `attempts` budget; no `onClose`
++  event is involved).
+ - Outer `send_audio(chunk)`: if `deliberate` or `exhausted`, drop
+   silently. If `inner` is null (mid-backoff or mid-connect), push to
+   `pending`; when `pending` is at `maxPendingChunks`, drop the oldest
+   chunk (FIFO shift) to bound memory. Otherwise forward to
+   `inner.send_audio` inside try/catch (provider contract says no throw,
+   but stay safe like `withIdleTimeout` does).
+-- Outer `close()`: set `deliberate`, clear `timer`, clear `pending`, call
+-  `inner?.close()` in try/catch. If no `onClose` has been forwarded yet,
+-  forward `events.onClose?.()` once, so `close()` still produces the
+-  close signal callers see today even when the socket was already dead or
+-  a backoff was pending.
++- Outer `close()`: set `deliberate`, clear `timer`, clear `recovering`,
++  clear `pending`, call `inner?.close()` in try/catch. Then forward
++  `events.onClose?.()` via the `closeForwarded` guard, so `close()` still
++  produces the close signal callers see today even when the socket was
++  already dead or a backoff was pending.
+ 
+ The `stableMs` reset prevents infinite flap: a socket that dies within 5s
+ of opening continues the same incident and burns the retry budget, while a
+@@ -298,6 +315,12 @@ inner provider:
+     `FakeWs` sequence: first socket `emit('close')` -> factory called
+     again -> second socket `emit('open')` -> pending audio flushes via
+     `send`.
++  - Fake-socket caveats: `FakeDgSocket.close()` and `FakeWs.close()` emit
++    `close` synchronously, which is exactly the re-entrancy the
++    `recovering`/`closeForwarded` guards cover; for AssemblyAI, emit
++    `open` before advancing cumulative fake time past the provider's 10s
++    `OPEN_TIMEOUT_MS`, or the provider's own open timeout rejects
++    `start_stream` and consumes attempts.
+ - `server/app.test.ts`: no changes required; the injected
+   `providerFactory` bypasses `createSTTProvider`, so the existing
+   FakeProvider keeps its current "unexpected close finishes the session"
+@@ -334,6 +357,12 @@ Manual acceptance (post-implementation, needs real keys; not a DoD gate):
+   30s idle timeout first and end the session with `IDLE_TIMEOUT`. Accepted
+   as billing hygiene (ADR-002): no billable stream exists during the gap
+   anyway, and speech resets the timer.
++- **WAV tee runs during the gap.** `SessionManager.sendAudio` tees every
++  chunk to the recorder before it reaches the stream, so audio buffered in
++  `pending` - including chunks later dropped by the overflow bound - still
++  lands in the session `.wav` in capture order. The file keeps the full
++  gap while the provider sees a compressed burst; accepted rather than
++  adding send-confirm plumbing to the recording path (PLAN-010).
+ - **Constants, not config.** Retry parameters are constructor-injectable
+   constants, not env vars - proportional documentation for a single-site
+   policy. Promote to `Config` only if operators ask for tuning.
+-- 
+2.50.0
+
+
+From 31386c30ef9187ed80c4ab07c5a1477172fd8718 Mon Sep 17 00:00:00 2001
+From: Satoshi Man <mrvuong.bitcoin@gmail.com>
+Date: Thu, 5 Nov 2026 21:11:41 +0700
+Subject: [PATCH 3/5] Reconnect dropped STT provider sockets with backoff
+
+Wrap both providers in a withReconnect decorator composed inside
+withIdleTimeout: unexpected close/error retries up to 5 times with
+exponential backoff and full jitter, buffers audio across the gap, and
+surfaces SttReconnectError only after retries exhaust. Manager rebases
+streamBaseS on the new onReconnect event and forwards error codes.
+---
+ server/session/manager.ts    |  34 +++-
+ server/stt/index.ts          |   5 +-
+ server/stt/provider.ts       |   1 +
+ server/stt/reconnect.test.ts | 363 +++++++++++++++++++++++++++++++++++
+ server/stt/reconnect.ts      | 202 +++++++++++++++++++
+ 5 files changed, 594 insertions(+), 11 deletions(-)
+ create mode 100644 server/stt/reconnect.test.ts
+ create mode 100644 server/stt/reconnect.ts
+
+diff --git a/server/session/manager.ts b/server/session/manager.ts
+index 7035d0c..917ec3d 100644
+--- a/server/session/manager.ts
++++ b/server/session/manager.ts
+@@ -238,23 +238,33 @@ export class SessionManager {
+     return active.info;
+   }
+ 
+-  private async openStream(active: ActiveSession): Promise<STTStream> {
+-    // Wall-clock seconds of audio already sent = where this stream's audio
+-    // lands in the session WAV (paused time produces no audio). Read at
+-    // entry: while paused the expression is time-invariant (the two
+-    // Date.now() terms cancel), so a resume gets the exact pre-pause total
+-    // even though stream setup latency follows.
++  // Wall-clock seconds of audio already sent = where this stream's audio
++  // lands in the session WAV (paused time produces no audio). Read at
++  // entry: while paused the expression is time-invariant (the two
++  // Date.now() terms cancel), so a resume gets the exact pre-pause total
++  // even though stream setup latency follows.
++  private unpausedElapsedS(active: ActiveSession): number {
+     const now = Date.now();
+-    active.streamBaseS =
++    return (
+       (now -
+         active.startedAtMs -
+         active.pausedTotalMs -
+         (active.paused ? now - active.pausedAtMs : 0)) /
+-      1000;
++      1000
++    );
++  }
++
++  private async openStream(active: ActiveSession): Promise<STTStream> {
++    active.streamBaseS = this.unpausedElapsedS(active);
+     return active.provider.start_stream(active.streamOpts, {
+       onPartial: (seg) => this.broadcast({ type: 'partial', segment: seg }),
+       onFinal: (seg) => void this.handleFinal(active, seg),
+       onError: (err) => this.handleSttError(active, err),
++      // Provider timestamps restart at 0 on each new socket; rebase so
++      // post-reconnect segments continue at wall-clock session time.
++      onReconnect: () => {
++        active.streamBaseS = this.unpausedElapsedS(active);
++      },
+       onClose: () => {
+         if (!active.stopping && !active.paused) {
+           this.log.warn('STT stream closed unexpectedly; ending session');
+@@ -465,7 +475,13 @@ export class SessionManager {
+       return;
+     }
+     this.log.error({ err, session: active.info.id }, 'STT stream error');
+-    this.broadcast({ type: 'error', message: err.message });
++    this.broadcast({
++      type: 'error',
++      message: err.message,
++      ...((err as { code?: string }).code
++        ? { code: (err as { code?: string }).code }
++        : {}),
++    });
+   }
+ 
+   private async finish(active: ActiveSession): Promise<void> {
+diff --git a/server/stt/index.ts b/server/stt/index.ts
+index c162750..c660040 100644
+--- a/server/stt/index.ts
++++ b/server/stt/index.ts
+@@ -2,6 +2,7 @@ import type { Config } from '../config.js';
+ import { AssemblyAIProvider } from './assemblyai.js';
+ import { DeepgramProvider } from './deepgram.js';
+ import { withIdleTimeout } from './idle-timeout.js';
++import { withReconnect } from './reconnect.js';
+ import type { STTProvider } from './provider.js';
+ 
+ export class ProviderConfigError extends Error {
+@@ -19,7 +20,7 @@ export function createSTTProvider(config: Config, diarize: boolean): STTProvider
+       );
+     }
+     return withIdleTimeout(
+-      new AssemblyAIProvider(config.ASSEMBLYAI_API_KEY),
++      withReconnect(new AssemblyAIProvider(config.ASSEMBLYAI_API_KEY)),
+       config.STT_IDLE_TIMEOUT_S,
+     );
+   }
+@@ -29,7 +30,7 @@ export function createSTTProvider(config: Config, diarize: boolean): STTProvider
+     );
+   }
+   return withIdleTimeout(
+-    new DeepgramProvider(config.DEEPGRAM_API_KEY),
++    withReconnect(new DeepgramProvider(config.DEEPGRAM_API_KEY)),
+     config.STT_IDLE_TIMEOUT_S,
+   );
+ }
+diff --git a/server/stt/provider.ts b/server/stt/provider.ts
+index 9fdbe71..f4b3256 100644
+--- a/server/stt/provider.ts
++++ b/server/stt/provider.ts
+@@ -18,6 +18,7 @@ export interface StreamEvents {
+   onFinal(seg: Segment): void;
+   onError(err: Error): void;
+   onClose?(): void;
++  onReconnect?(): void;
+ }
+ 
+ export interface STTStream {
+diff --git a/server/stt/reconnect.test.ts b/server/stt/reconnect.test.ts
+new file mode 100644
+index 0000000..0c65c00
+--- /dev/null
++++ b/server/stt/reconnect.test.ts
+@@ -0,0 +1,363 @@
++import { EventEmitter } from 'node:events';
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
++import { SttReconnectError, withReconnect } from './reconnect.js';
++import { DeepgramProvider, type DgSocketLike } from './deepgram.js';
++import { AssemblyAIProvider, type WSLike } from './assemblyai.js';
++import type {
++  STTProvider,
++  STTStream,
++  StreamEvents,
++  StreamOptions,
++} from './provider.js';
++
++class FakeStream implements STTStream {
++  audio: Buffer[] = [];
++  closed = false;
++  send_audio(c: Buffer): void {
++    this.audio.push(c);
++  }
++  close(): void {
++    this.closed = true;
++  }
++}
++
++class ScriptedProvider implements STTProvider {
++  readonly name = 'scripted';
++  readonly supports_diarization = false;
++  startCount = 0;
++  streams: FakeStream[] = [];
++  rejectCount = 0;
++  private lastEvents?: StreamEvents;
++
++  start_stream(_opts: StreamOptions, events: StreamEvents): Promise<STTStream> {
++    this.startCount++;
++    this.lastEvents = events;
++    if (this.rejectCount > 0) {
++      this.rejectCount--;
++      return Promise.reject(new Error('connect failed'));
++    }
++    const stream = new FakeStream();
++    this.streams.push(stream);
++    return Promise.resolve(stream);
++  }
++
++  emitClose(): void {
++    this.lastEvents?.onClose?.();
++  }
++
++  emitError(err: Error): void {
++    this.lastEvents?.onError(err);
++  }
++}
++
++function makeEvents() {
++  const errors: Error[] = [];
++  let closes = 0;
++  let reconnects = 0;
++  const events: StreamEvents = {
++    onPartial: () => {},
++    onFinal: () => {},
++    onError: (e) => errors.push(e),
++    onClose: () => closes++,
++    onReconnect: () => reconnects++,
++  };
++  return {
++    events,
++    errors,
++    closes: () => closes,
++    reconnects: () => reconnects,
++  };
++}
++
++const opts = { diarize: false };
++
++describe('withReconnect (scripted inner provider)', () => {
++  beforeEach(() => vi.useFakeTimers());
++  afterEach(() => vi.useRealTimers());
++
++  it('retries once after an unexpected close without forwarding onClose', async () => {
++    const inner = new ScriptedProvider();
++    const provider = withReconnect(inner, { random: () => 0.5 });
++    const { events, closes, reconnects } = makeEvents();
++    const stream = await provider.start_stream(opts, events);
++
++    inner.emitClose();
++    expect(inner.startCount).toBe(1);
++    await vi.advanceTimersByTimeAsync(500);
++    expect(inner.startCount).toBe(2);
++    expect(closes()).toBe(0);
++    expect(reconnects()).toBe(1);
++    stream.close();
++  });
++
++  it('treats an unexpected error like a dropped stream and holds it back', async () => {
++    const inner = new ScriptedProvider();
++    const provider = withReconnect(inner, { random: () => 0.5 });
++    const { events, errors } = makeEvents();
++    const stream = await provider.start_stream(opts, events);
++
++    inner.emitError(new Error('socket boom'));
++    expect(inner.streams[0]!.closed).toBe(true);
++    await vi.advanceTimersByTimeAsync(500);
++    expect(inner.startCount).toBe(2);
++    expect(errors).toHaveLength(0);
++    stream.close();
++  });
++
++  it('backs off at 0.5/1/2/4/8s and never makes a 6th attempt', async () => {
++    const inner = new ScriptedProvider();
++    const provider = withReconnect(inner, { random: () => 0.5 });
++    const { events, errors, closes } = makeEvents();
++    await provider.start_stream(opts, events);
++
++    const delays = [500, 1000, 2000, 4000, 8000];
++    for (const [i, delay] of delays.entries()) {
++      inner.emitClose();
++      await vi.advanceTimersByTimeAsync(delay - 1);
++      expect(inner.startCount).toBe(i + 1);
++      await vi.advanceTimersByTimeAsync(1);
++      expect(inner.startCount).toBe(i + 2);
++    }
++
++    inner.emitClose();
++    await vi.advanceTimersByTimeAsync(60_000);
++    expect(inner.startCount).toBe(6);
++    expect(errors).toHaveLength(1);
++    expect(errors[0]).toBeInstanceOf(SttReconnectError);
++    expect(closes()).toBe(1);
++  });
++
++  it('emits one SttReconnectError then one onClose after 5 failed attempts', async () => {
++    const inner = new ScriptedProvider();
++    const provider = withReconnect(inner, { random: () => 0.5 });
++    const { events, errors, closes } = makeEvents();
++    await provider.start_stream(opts, events);
++
++    inner.rejectCount = 5;
++    inner.emitClose();
++    await vi.advanceTimersByTimeAsync(500 + 1000 + 2000 + 4000 + 8000);
++
++    expect(inner.startCount).toBe(6);
++    expect(errors).toHaveLength(1);
++    const err = errors[0]!;
++    expect(err).toBeInstanceOf(SttReconnectError);
++    expect((err as SttReconnectError).code).toBe('STT_RECONNECT_FAILED');
++    expect((err as SttReconnectError).attempts).toBe(5);
++    expect(err.message).toBe(
++      'STT stream lost; reconnect failed after 5 attempts',
++    );
++    expect(closes()).toBe(1);
++  });
++
++  it('buffers audio during the gap and flushes in order to the new stream', async () => {
++    const inner = new ScriptedProvider();
++    const provider = withReconnect(inner, { random: () => 0.5 });
++    const { events } = makeEvents();
++    const stream = await provider.start_stream(opts, events);
++
++    stream.send_audio(Buffer.from('a'));
++    inner.emitClose();
++    stream.send_audio(Buffer.from('b'));
++    stream.send_audio(Buffer.from('c'));
++    await vi.advanceTimersByTimeAsync(500);
++
++    expect(inner.streams[0]!.audio.map(String)).toEqual(['a']);
++    expect(inner.streams[1]!.audio.map(String)).toEqual(['b', 'c']);
++    stream.send_audio(Buffer.from('d'));
++    expect(inner.streams[1]!.audio.map(String)).toEqual(['b', 'c', 'd']);
++    stream.close();
++  });
++
++  it('drops the oldest chunks when the pending buffer overflows', async () => {
++    const inner = new ScriptedProvider();
++    const provider = withReconnect(inner, {
++      random: () => 0.5,
++      maxPendingChunks: 3,
++    });
++    const { events } = makeEvents();
++    const stream = await provider.start_stream(opts, events);
++
++    inner.emitClose();
++    for (const c of ['a', 'b', 'c', 'd', 'e']) {
++      stream.send_audio(Buffer.from(c));
++    }
++    await vi.advanceTimersByTimeAsync(500);
++    expect(inner.streams[1]!.audio.map(String)).toEqual(['c', 'd', 'e']);
++    stream.close();
++  });
++
++  it('cancels a pending retry on close() and never reconnects', async () => {
++    const inner = new ScriptedProvider();
++    const provider = withReconnect(inner, { random: () => 0.5 });
++    const { events, closes } = makeEvents();
++    const stream = await provider.start_stream(opts, events);
++
++    inner.emitClose();
++    stream.close();
++    expect(closes()).toBe(1);
++    await vi.advanceTimersByTimeAsync(60_000);
++    expect(inner.startCount).toBe(1);
++  });
++
++  it('is a no-op on close() after exhaustion beyond the single forwarded close', async () => {
++    const inner = new ScriptedProvider();
++    const provider = withReconnect(inner, {
++      random: () => 0.5,
++      maxAttempts: 1,
++    });
++    const { events, errors, closes } = makeEvents();
++    const stream = await provider.start_stream(opts, events);
++
++    inner.emitClose();
++    await vi.advanceTimersByTimeAsync(500);
++    expect(inner.startCount).toBe(2);
++    inner.emitClose();
++    expect(errors).toHaveLength(1);
++    expect(closes()).toBe(1);
++
++    stream.close();
++    await vi.advanceTimersByTimeAsync(60_000);
++    expect(closes()).toBe(1);
++    expect(errors).toHaveLength(1);
++    expect(inner.startCount).toBe(2);
++  });
++
++  it('resets the attempt budget when the lost stream survived stableMs', async () => {
++    const inner = new ScriptedProvider();
++    const provider = withReconnect(inner, { random: () => 0.5 });
++    const { events } = makeEvents();
++    const stream = await provider.start_stream(opts, events);
++
++    inner.emitClose();
++    await vi.advanceTimersByTimeAsync(500);
++    expect(inner.startCount).toBe(2);
++
++    // the replacement survives past stableMs, then drops: fresh budget
++    await vi.advanceTimersByTimeAsync(6000);
++    inner.emitClose();
++    await vi.advanceTimersByTimeAsync(499);
++    expect(inner.startCount).toBe(2);
++    await vi.advanceTimersByTimeAsync(1);
++    expect(inner.startCount).toBe(3);
++    stream.close();
++  });
++
++  it('consumes an attempt on a rejected reconnect and keeps retrying', async () => {
++    const inner = new ScriptedProvider();
++    const provider = withReconnect(inner, { random: () => 0.5 });
++    const { events, errors } = makeEvents();
++    const stream = await provider.start_stream(opts, events);
++
++    inner.emitClose();
++    inner.rejectCount = 1;
++    await vi.advanceTimersByTimeAsync(500);
++    expect(inner.startCount).toBe(2);
++
++    await vi.advanceTimersByTimeAsync(999);
++    expect(inner.startCount).toBe(2);
++    await vi.advanceTimersByTimeAsync(1);
++    expect(inner.startCount).toBe(3);
++    expect(errors).toHaveLength(0);
++    stream.close();
++  });
++});
++
++class FakeDgSocket extends EventEmitter implements DgSocketLike {
++  binary: Buffer[] = [];
++  closedFlag = false;
++  readyState?: number;
++  connect(): void {}
++  sendMedia(chunk: ArrayBufferView): void {
++    this.binary.push(
++      Buffer.from(
++        chunk.buffer as ArrayBuffer,
++        chunk.byteOffset,
++        chunk.byteLength,
++      ),
++    );
++  }
++  sendCloseStream(): void {}
++  close(): void {
++    this.closedFlag = true;
++    this.emit('close');
++  }
++}
++
++class FakeWs extends EventEmitter implements WSLike {
++  binary: Buffer[] = [];
++  text: string[] = [];
++  closedFlag = false;
++  send(data: string | Buffer): void {
++    if (typeof data === 'string') this.text.push(data);
++    else this.binary.push(data);
++  }
++  close(): void {
++    this.closedFlag = true;
++    this.emit('close');
++  }
++}
++
++describe('withReconnect over real providers (fake sockets)', () => {
++  beforeEach(() => vi.useFakeTimers());
++  afterEach(() => vi.useRealTimers());
++
++  it('reconnects a dropped Deepgram socket and flushes buffered audio on open', async () => {
++    const sockets: FakeDgSocket[] = [];
++    const provider = withReconnect(
++      new DeepgramProvider('test-key', async () => {
++        const s = new FakeDgSocket();
++        s.readyState = sockets.length === 0 ? 1 : 0;
++        sockets.push(s);
++        return s;
++      }),
++      { random: () => 0.5 },
++    );
++    const { events, closes } = makeEvents();
++    const stream = await provider.start_stream(opts, events);
++
++    stream.send_audio(Buffer.from('a'));
++    expect(sockets[0]!.binary.map(String)).toEqual(['a']);
++
++    sockets[0]!.emit('close');
++    stream.send_audio(Buffer.from('gap'));
++    await vi.advanceTimersByTimeAsync(500);
++    expect(sockets).toHaveLength(2);
++    expect(closes()).toBe(0);
++    // reconnect resolved while socket2 was still CONNECTING: the pending
++    // chunk waits in the provider's pre-open buffer until 'open'
++    sockets[1]!.readyState = 1;
++    sockets[1]!.emit('open');
++    expect(sockets[1]!.binary.map(String)).toEqual(['gap']);
++    stream.close();
++  });
++
++  it('reconnects a dropped AssemblyAI socket and flushes pending audio via send', async () => {
++    const sockets: FakeWs[] = [];
++    const provider = withReconnect(
++      new AssemblyAIProvider('test-key', () => {
++        const s = new FakeWs();
++        sockets.push(s);
++        return s;
++      }),
++      { random: () => 0.5 },
++    );
++    const { events, closes } = makeEvents();
++    const startP = provider.start_stream(opts, events);
++    sockets[0]!.emit('open');
++    const stream = await startP;
++
++    stream.send_audio(Buffer.from('a'));
++    expect(sockets[0]!.binary.map(String)).toEqual(['a']);
++
++    sockets[0]!.emit('close');
++    stream.send_audio(Buffer.from('gap'));
++    await vi.advanceTimersByTimeAsync(500);
++    expect(sockets).toHaveLength(2);
++    expect(closes()).toBe(0);
++    // emit 'open' before cumulative fake time crosses OPEN_TIMEOUT_MS
++    sockets[1]!.emit('open');
++    await vi.advanceTimersByTimeAsync(0);
++    expect(sockets[1]!.binary.map(String)).toEqual(['gap']);
++    stream.close();
++  });
++});
+diff --git a/server/stt/reconnect.ts b/server/stt/reconnect.ts
+new file mode 100644
+index 0000000..e88660a
+--- /dev/null
++++ b/server/stt/reconnect.ts
+@@ -0,0 +1,202 @@
++import type {
++  STTProvider,
++  STTStream,
++  StreamEvents,
++  StreamOptions,
++} from './provider.js';
++
++export interface ReconnectOptions {
++  maxAttempts?: number;
++  baseDelayMs?: number;
++  stableMs?: number;
++  maxPendingChunks?: number;
++  random?: () => number;
++}
++
++export class SttReconnectError extends Error {
++  readonly code = 'STT_RECONNECT_FAILED';
++  readonly attempts: number;
++  constructor(attempts: number, cause?: Error) {
++    super(`STT stream lost; reconnect failed after ${attempts} attempts`, {
++      cause,
++    });
++    this.name = 'SttReconnectError';
++    this.attempts = attempts;
++  }
++}
++
++// Provider-side sockets drop mid-session; rather than ending the session,
++// retry the stream transparently (BDR-001 real-time requirement) inside a
++// bounded retry window (BDR-002 cost ceiling, ADR-002 billing hygiene).
++export function withReconnect(
++  provider: STTProvider,
++  opts: ReconnectOptions = {},
++): STTProvider {
++  const maxAttempts = opts.maxAttempts ?? 5;
++  const baseDelayMs = opts.baseDelayMs ?? 1000;
++  const stableMs = opts.stableMs ?? 5000;
++  const maxPendingChunks = opts.maxPendingChunks ?? 512;
++  const random = opts.random ?? Math.random;
++
++  return {
++    name: provider.name,
++    supports_diarization: provider.supports_diarization,
++    async start_stream(
++      streamOpts: StreamOptions,
++      events: StreamEvents,
++    ): Promise<STTStream> {
++      let deliberate = false;
++      let inner: STTStream | null = null;
++      const pending: Buffer[] = [];
++      let attempts = 0;
++      let timer: ReturnType<typeof setTimeout> | undefined;
++      let openedAt = 0;
++      let lastError: Error | undefined;
++      let exhausted = false;
++      let recovering = false;
++      let closeForwarded = false;
++
++      const forwardClose = () => {
++        if (closeForwarded) return;
++        closeForwarded = true;
++        events.onClose?.();
++      };
++
++      const delayFor = (n: number) => baseDelayMs * 2 ** (n - 1) * random();
++
++      const scheduleAttempt = () => {
++        if (deliberate) return;
++        if (attempts >= maxAttempts) {
++          exhausted = true;
++          recovering = false;
++          pending.length = 0;
++          const dead = inner;
++          inner = null;
++          if (dead) {
++            try {
++              dead.close();
++            } catch {
++              // already gone
++            }
++          }
++          events.onError(new SttReconnectError(attempts, lastError));
++          forwardClose();
++          return;
++        }
++        attempts++;
++        timer = setTimeout(connect, delayFor(attempts));
++      };
++
++      const beginReconnect = () => {
++        // A stream that survived >= stableMs counts as a new incident with a
++        // fresh budget; a socket dying right after open burns the same one.
++        if (Date.now() - openedAt >= stableMs) attempts = 0;
++        scheduleAttempt();
++      };
++
++      const connect = async () => {
++        try {
++          const fresh = await provider.start_stream(streamOpts, wrappedEvents);
++          if (deliberate) {
++            // Opened after the caller stopped: a stray billable socket.
++            try {
++              fresh.close();
++            } catch {
++              // already gone
++            }
++            return;
++          }
++          inner = fresh;
++          recovering = false;
++          openedAt = Date.now();
++          for (const chunk of pending.splice(0)) {
++            try {
++              inner.send_audio(chunk);
++            } catch {
++              break;
++            }
++          }
++          pending.length = 0;
++          events.onReconnect?.();
++        } catch (err) {
++          lastError = err instanceof Error ? err : new Error(String(err));
++          scheduleAttempt();
++        }
++      };
++
++      const wrappedEvents: StreamEvents = {
++        onPartial: (seg) => events.onPartial(seg),
++        onFinal: (seg) => events.onFinal(seg),
++        onError: (err) => {
++          lastError = err;
++          if (deliberate) {
++            events.onError(err);
++            return;
++          }
++          if (recovering || exhausted) return;
++          // Transient errors are held from the client; the stream only
++          // surfaces an error once retries exhaust.
++          recovering = true;
++          const dead = inner;
++          inner = null;
++          if (dead) {
++            try {
++              dead.close();
++            } catch {
++              // already gone
++            }
++          }
++          beginReconnect();
++        },
++        onClose: () => {
++          if (deliberate) {
++            forwardClose();
++            return;
++          }
++          if (recovering || exhausted) return;
++          recovering = true;
++          inner = null;
++          beginReconnect();
++        },
++      };
++
++      // First-connect failures still reject session start; only established
++      // streams are reconnected.
++      inner = await provider.start_stream(streamOpts, wrappedEvents);
++      openedAt = Date.now();
++
++      return {
++        send_audio: (chunk: Buffer) => {
++          if (deliberate || exhausted) return;
++          const target = inner;
++          if (target === null) {
++            pending.push(chunk);
++            if (pending.length > maxPendingChunks) pending.shift();
++            return;
++          }
++          try {
++            target.send_audio(chunk);
++          } catch {
++            // providers must not throw, but stay safe if one does
++          }
++        },
++        close: () => {
++          deliberate = true;
++          if (timer) clearTimeout(timer);
++          recovering = false;
++          pending.length = 0;
++          const dead = inner;
++          inner = null;
++          if (dead) {
++            try {
++              dead.close();
++            } catch {
++              // already gone
++            }
++          }
++          forwardClose();
++        },
++      };
++    },
++  };
++}
+-- 
+2.50.0
+
+
+From 7fa9ac51781d7621e432e5c9e342136797d67772 Mon Sep 17 00:00:00 2001
+From: Satoshi Man <mrvuong.bitcoin@gmail.com>
+Date: Thu, 5 Nov 2026 21:11:41 +0700
+Subject: [PATCH 4/5] plan: mark PLAN-012 implemented, DoD complete
+
+---
+ .../PLAN-012-stt-stream-reconnect.md           | 18 +++++++++---------
+ 1 file changed, 9 insertions(+), 9 deletions(-)
+
+diff --git a/CONTEXTS/03-implement-plan/PLAN-012-stt-stream-reconnect.md b/CONTEXTS/03-implement-plan/PLAN-012-stt-stream-reconnect.md
+index aaee918..7bc64e2 100644
+--- a/CONTEXTS/03-implement-plan/PLAN-012-stt-stream-reconnect.md
++++ b/CONTEXTS/03-implement-plan/PLAN-012-stt-stream-reconnect.md
+@@ -1,6 +1,6 @@
+ ---
+ id: PLAN-012-stt-stream-reconnect
+-status: draft
++status: implemented
+ date: 2026-11-05
+ review_count: 1
+ patch: applied
+@@ -10,7 +10,7 @@ patch: applied
+ 
+ ## Status
+ 
+-draft
++implemented
+ 
+ ## Context
+ 
+@@ -379,22 +379,22 @@ Manual acceptance (post-implementation, needs real keys; not a DoD gate):
+ 
+ ## Definition of Done
+ 
+-- [ ] `withReconnect` in `server/stt/reconnect.ts` implements the pinned
++- [x] `withReconnect` in `server/stt/reconnect.ts` implements the pinned
+       state machine: unexpected close/error schedules up to 5 retries at
+       `baseDelayMs * 2^(n-1) * random()`; `stableMs` resets the incident
+       budget; pending audio is bounded at `maxPendingChunks` (drop-oldest)
+       and flushed in order on the replacement stream; `onReconnect` fires
+       after a successful reconnect.
+-- [ ] Deliberate `close()` (including pause/stop/shutdown paths) cancels
++- [x] Deliberate `close()` (including pause/stop/shutdown paths) cancels
+       any pending retry and never reconnects.
+-- [ ] After 5 failed attempts the outer events see one
++- [x] After 5 failed attempts the outer events see one
+       `SttReconnectError` (`code: 'STT_RECONNECT_FAILED'`) followed by one
+       `onClose`, which ends the session through the existing manager path.
+-- [ ] `StreamEvents.onReconnect` added; `createSTTProvider` composes
++- [x] `StreamEvents.onReconnect` added; `createSTTProvider` composes
+       `withIdleTimeout(withReconnect(provider))` for both providers.
+-- [ ] Manager rebases `streamBaseS` on `onReconnect` and forwards `code`
++- [x] Manager rebases `streamBaseS` on `onReconnect` and forwards `code`
+       on error broadcasts.
+-- [ ] `server/stt/reconnect.test.ts` covers every case in the test plan
++- [x] `server/stt/reconnect.test.ts` covers every case in the test plan
+       using scripted inner providers and injected fake sockets only; no
+       test touches the real network or real provider keys.
+-- [ ] `npm test` and `npm run typecheck` pass.
++- [x] `npm test` and `npm run typecheck` pass.
+-- 
+2.50.0
+
+
+From 5b74db7d55fd24b9b7617df3c71937b414e3833b Mon Sep 17 00:00:00 2001
+From: Satoshi Man <mrvuong.bitcoin@gmail.com>
+Date: Thu, 5 Nov 2026 21:11:53 +0700
+Subject: [PATCH 5/5] log: implement PLAN-012 STT stream reconnect
+
+---
+ CONTEXTS/04-logs/2026-11-05.md | 96 +++++++++++++++++++++++++++++++++-
+ 1 file changed, 94 insertions(+), 2 deletions(-)
+
+diff --git a/CONTEXTS/04-logs/2026-11-05.md b/CONTEXTS/04-logs/2026-11-05.md
+index a251d67..22f16bd 100644
+--- a/CONTEXTS/04-logs/2026-11-05.md
++++ b/CONTEXTS/04-logs/2026-11-05.md
+@@ -1,11 +1,11 @@
+ ---
+ date: "2026-11-05"
+-events_count: 88
++events_count: 91
+ ---
+ 
+ # Events on 2026-11-05
+ 
+-Total events: **88**
++Total events: **91**
+ 
+ ## Table of contents
+ 
+@@ -97,6 +97,9 @@ Total events: **88**
+ - [17:56 - Add README and MIT license](#1756---add-readme-and-mit-license)
+ - [17:58 - Update license copyright to real name](#1758---update-license-copyright-to-real-name)
+ - [18:31 - Standardize workflow name in README](#1831---standardize-workflow-name-in-readme)
++- [21:02 - Draft PLAN-012: STT stream reconnect](#2102---draft-plan-012-stt-stream-reconnect)
++- [21:06 - Review PLAN-012 pass 1: patch reconnect state machine](#2106---review-plan-012-pass-1-patch-reconnect-state-machine)
++- [21:11 - Implement PLAN-012: STT stream reconnect](#2111---implement-plan-012-stt-stream-reconnect)
+ 
+ ---
+ 
+@@ -3124,3 +3127,92 @@ README.md
+ None
+ 
+ ---
++## 21:02 - Draft PLAN-012: STT stream reconnect
++
++**Scope:** CONTEXTS/03-implement-plan | **Type:** Docs
++
++## Scope
++CONTEXTS/03-implement-plan
++
++## Type
++Docs
++
++## User request
++Draft only an implementation plan (new PLAN id) for reconnecting the STT websocket on unexpected drops; record assumptions in Risks; do not implement; commit only the plan document.
++
++## Reason
++Unexpected provider socket close currently ends the session via SessionManager.finish. Chose a provider decorator matching the withIdleTimeout pattern so both providers are covered and reconnect logic is testable with injected fake sockets; composition order pinned so idle-triggered closes stay deliberate.
++
++## Description
++Drafted implementation plan for automatic reconnection of dropped STT provider sockets: a withReconnect decorator composed inside withIdleTimeout, 5 retries with exponential backoff and full jitter, bounded pending-audio buffer flushed on reconnect, streamBaseS rebase via new onReconnect event, and SttReconnectError surfaced through the existing error broadcast after exhaustion.
++
++## Files changed
++CONTEXTS/03-implement-plan/PLAN-012-stt-stream-reconnect.md
++
++## Notes
++Plan is draft with review_count 0; per AGENTS.md it needs at least one verification pass and developer approval before implementation.
++
++---
++## 21:06 - Review PLAN-012 pass 1: patch reconnect state machine
++
++**Scope:** CONTEXTS/03-implement-plan | **Type:** Docs
++
++## Scope
++CONTEXTS/03-implement-plan
++
++## Type
++Docs
++
++## User request
++Run ONE verification pass on the newest PLAN in CONTEXTS/03-implement-plan/ per AGENTS.md workflow: re-check it against BDRs, ADRs, and the codebase; patch divergences in the plan; update review_count and patch frontmatter. Do NOT implement. Commit only plan changes.
++
++## Reason
++AGENTS.md requires at least one verification pass before a plan may be implemented; the pass caught re-entrancy and resource-leak defects in the pinned state machine that would have failed the plan's own pinned tests.
++
++## Description
++Ran the first verification pass on PLAN-012 against BDRs, ADRs, and the codebase. Re-checking the pinned state machine against the fake-socket harnesses exposed four divergences, all patched in place: (1) synchronous close re-emission from inner.close() (both FakeDgSocket and FakeWs emit close inside close()) could double-schedule attempts, fixed by pinning a recovering flag plus flag-then-clear-then-close ordering; (2) a start_stream resolving after a deliberate close would leak a billable socket, now pinned to close-and-drop on late resolve; (3) openedAt was never initialized for the first stream and the once-only onClose forwarding lacked its closeForwarded flag; (4) an unfinished self-edit in the flush semantics was cleaned up. Added a WAV-tee risk note (buffered or dropped gap audio still lands in the .wav) and fake-socket test caveats (synchronous close emission, AssemblyAI 10s OPEN_TIMEOUT vs cumulative fake-time advance). Frontmatter updated to review_count 1, patch applied; status stays draft pending developer approval.
++
++## Files changed
++CONTEXTS/03-implement-plan/PLAN-012-stt-stream-reconnect.md
++
++## Notes
++No BDR/ADR violations found: decorator stays behind STTProvider (ADR-002), no new deps (ADR-006), bounded retries preserve billing hygiene (BDR-002). Plan is now implementable pending developer status transition to reviewed/approved.
++
++---
++## 21:11 - Implement PLAN-012: STT stream reconnect
++
++**Scope:** server/stt | **Type:** Feature | **Commit:** 7fa9ac5 @ doc-centric
++
++## Scope
++server/stt
++
++## Type
++Feature
++
++## Commit
++- **Hash:** 7fa9ac5
++- **Repo:** doc-centric
++- **Message:** plan: mark PLAN-012 implemented, DoD complete
++- **Author:** Satoshi Man <mrvuong.bitcoin@gmail.com>
++- **Date:** 2026-11-05 21:11:41 +0700
++
++## User request
++Implement the newest PLAN in CONTEXTS/03-implement-plan/ exactly per its scope and DoD. Commit, tick DoD items, set status: implemented, and log via CONTEXTS/04-logs/event.py.
++
++## Reason
++PLAN-012 (reviewed, patch applied): provider socket drops previously ended the session via SessionManager.finish. Decorator matches the withIdleTimeout composition style so reconnect applies to both providers, keeps deliberate closes from resurrecting streams, and stays bounded for billing hygiene per ADR-002/BDR-002.
++
++## Description
++Implemented the withReconnect provider decorator: unexpected socket close/error retries up to 5 times with exponential backoff (full jitter), stableMs resets the incident budget, pending audio is bounded and flushed in order on the replacement stream, deliberate close cancels retries, and exhaustion emits SttReconnectError then onClose. Added StreamEvents.onReconnect, composed withReconnect inside withIdleTimeout in createSTTProvider, and updated SessionManager to rebase streamBaseS on reconnect and forward error codes on broadcasts. Covered by reconnect.test.ts with scripted inner providers and fake sockets.
++
++## Files changed
++server/stt/reconnect.ts
++server/stt/reconnect.test.ts
++server/stt/provider.ts
++server/stt/index.ts
++server/session/manager.ts
++
++## Notes
++Retry params are constants, not env config. Buffered burst compresses gap timestamps; streamBaseS rebase keeps later segments monotonic. A silent gap can still hit the idle timeout (accepted billing hygiene).
++
++---
+-- 
+2.50.0
+

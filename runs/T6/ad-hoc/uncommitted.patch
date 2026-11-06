@@ -1,0 +1,14 @@
+diff --git a/.env.example b/.env.example
+index 34b26a5..968fabf 100644
+--- a/.env.example
++++ b/.env.example
+@@ -27,5 +27,9 @@ LLM_FALLBACK_MODEL=gpt-4.1-mini
+ # Overridable per session in the UI.
+ DEFAULT_TARGET_LANG=vi
+ 
++# Fold consecutive same-speaker transcript segments into one stored cue when
++# the merged span stays under this many seconds. 0 disables (pre-fold output).
++TRANSCRIPT_MERGE_MAX_S=10
++
+ # Backend bind port (always 127.0.0.1).
+ PORT=3000

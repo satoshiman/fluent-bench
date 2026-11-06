@@ -1,0 +1,50 @@
+session_id,run_dir,model,agent_mode,created_at,last_activity_at,title
+laced-parade,T1/ad-hoc,swe-2-high,normal,1793881895,1793881898,reply with exactly: AUTH_OK
+climbing-buckthorn,T1/ad-hoc,swe-2-high,bypass,1793881905,1793881993,Add WebVTT Session Transcript Export Endpoint and Tests
+discreet-danger,T1/ad-hoc,swe-2-high,bypass,1793882089,1793882264,"Add a WebVTT session transcript export endpoint with tests for success, 404, ..."
+glass-stallion,T1/doc-centric,swe-2-high,bypass,1793882356,1793882541,Add a WebVTT export endpoint for stored session transcripts
+longhaired-plutonium,T2/ad-hoc,swe-2-high,bypass,1793882623,1793882802,Add exponential backoff retries for translation API calls
+standing-raincoat,T2/doc-centric,,,1793882819,1793883035,Add exponential backoff retries for transient translation API failures
+daffodil-transport,T1/doc-centric,swe-2-high,bypass,1793885246,1793885379,Plan WebVTT Session Export Endpoint and Tests
+chisel-reader,T1/doc-centric,swe-2-high,bypass,1793885380,1793885487,Verify and Patch the Newest Implementation Plan Against BDRs and ADRs
+steady-mare,T1/doc-centric,swe-2-high,bypass,1793885488,1793885644,Implement Newest Plan and Log Completion
+kind-peach,T2/doc-centric,swe-2-high,bypass,1793885645,1793885971,"Draft an implementation plan for translation API retry behavior, without impl..."
+wealthy-basketball,T2/doc-centric,swe-2-high,bypass,1793885972,1793886246,"Verify and patch the newest implementation plan against BDRs, ADRs, and codebase"
+daily-lumber,T2/doc-centric,swe-2-high,bypass,1793886247,1793886414,"Implement Newest Plan, Verify DoD, Commit, and Log Completion"
+leaf-clematis,T3/ad-hoc,swe-2-high,bypass,1793886415,1793886924,Add automatic STT websocket reconnection with buffered audio replay and mocke...
+forest-matrix,T3/doc-centric,swe-2-high,bypass,1793886925,1793887364,Plan automatic STT websocket reconnection with mocked-socket tests
+local-need,T3/doc-centric,swe-2-high,bypass,1793887365,1793887597,"Verify and patch the newest implementation plan against BDRs, ADRs, and codebase"
+agate-raven,T3/doc-centric,swe-2-high,bypass,1793887597,1793887917,Implement Newest Plan and Record Completion in Event Log
+ninth-copper,T4/doc-centric,swe-2-high,bypass,1793887917,1793888019,Plan Sessions Page Search and Filtering Implementation
+impossible-detective,T4/doc-centric,swe-2-high,bypass,1793888019,1793888104,Verify and patch the newest implementation plan without implementing
+ritzy-roar,T4/doc-centric,swe-2-high,bypass,1793888105,1793888327,Implement the Newest Plan and Record Completion in Contexts Logs
+juvenile-octopus,T4/ad-hoc,swe-2-high,bypass,1793888328,1793888438,Add live search and empty state to the Sessions page
+quilted-adjustment,T5/doc-centric,swe-2-high,bypass,1793888440,1793888643,Plan Review Page Playback Speed Control
+shimmering-podium,T5/doc-centric,swe-2-high,bypass,1793888645,1793888840,"Verify and patch newest implementation plan against BDRs, ADRs, and codebase"
+rogue-august,T5/doc-centric,swe-2-high,bypass,1793888840,1793889099,Implement the Newest Plan and Update Its Status and Log
+flossy-link,T5/ad-hoc,swe-2-high,bypass,1793889100,1793889192,Add playback speed control to the Review page audio player
+invincible-game,T6/doc-centric,swe-2-high,bypass,1793889193,1793889553,Plan configurable merging of short same-speaker transcript segments into pers...
+ritzy-aquarius,T6/doc-centric,swe-2-high,bypass,1793889554,1793889743,"Verify and patch newest implementation plan against BDRs, ADRs, and codebase"
+tiny-light,T6/doc-centric,swe-2-high,bypass,1793889743,1793890087,"Implement newest plan, satisfy DoD, commit, and log completion"
+fluttering-request,T6/ad-hoc,swe-2-high,bypass,1793890088,1793890401,Add configurable merging of short consecutive same-speaker transcript segments
+hissing-crow,chain/work,swe-2-high,bypass,1793890402,1793890671,Plan WAV recording pause/resume behavior and tests
+ajar-chanter,chain/work,swe-2-high,bypass,1793890672,1793890880,"Verify and patch the newest implementation plan against BDRs, ADRs, and codebase"
+sneaky-geography,chain/work,swe-2-high,bypass,1793890880,1793891015,Implement the Newest Plan and Log Completion
+zany-jaguar,chain/work,swe-2-high,bypass,1793891016,1793891301,Plan WAV recording size cap and file rotation
+fifth-honeycup,chain/work,swe-2-high,bypass,1793891301,1793891455,Verify and Patch the Newest Implementation Plan Without Implementing
+bevel-cricket,chain/work,swe-2-high,bypass,1793891455,1793891639,Implement the newest plan and log completion in CONTEXTS/03-implement-plan/ a...
+fork-chartreuse,chain/work,swe-2-high,bypass,1793891640,1793891829,Plan recording status indicators and error notifications in the UI
+circular-potato,chain/work,swe-2-high,bypass,1793891829,1793892108,"Verify and patch the newest implementation plan against BDRs, ADRs, and codebase"
+mutual-snarl,chain/work,swe-2-high,bypass,1793892108,1793892491,"Implement Latest Plan, Mark DoD Complete, and Log Implementation"
+unequaled-jodhpur,V1/ad-hoc-vague,swe-2-high,bypass,1793892552,1793892686,Add VTT Export for Session Transcripts
+nickel-station,V1/doc-centric-vague,swe-2-high,bypass,1793892687,1793892923,Add VTT Export for Session Transcripts
+horse-talos,V1/doc-centric-vague,swe-2-high,bypass,1793892923,1793893100,"Verify and Patch the Newest Implementation Plan Against BDRs, ADRs, and Codebase"
+general-almond,V1/doc-centric-vague,swe-2-high,bypass,1793893101,1793893526,"Implement newest plan, update DoD and status, commit, and log the event"
+berry-statistic,V2/ad-hoc-vague,swe-2-high,bypass,1793893527,1793893689,Add retries for translation network errors
+brief-geology,V2/doc-centric-vague,swe-2-high,bypass,1793893690,1793893832,Draft a Plan to Retry Translation Calls on Network Errors
+awake-treatment,V2/doc-centric-vague,swe-2-high,bypass,1793893832,1793894039,Verify and patch the newest implementation plan; commit plan changes only
+dark-alfalfa,V2/doc-centric-vague,swe-2-high,bypass,1793894040,1793894201,Implement Newest Plan and Log Completion
+exultant-hydrant,V3/doc-centric-vague,swe-2-high,bypass,1793894202,1793894293,Draft an implementation plan for adding session search (no implementation)
+mild-bite,V3/doc-centric-vague,swe-2-high,bypass,1793894294,1793894434,"Verify and patch the newest implementation plan against BDRs, ADRs, and codebase"
+frosted-visitor,V3/doc-centric-vague,swe-2-high,bypass,1793894435,1793894747,Implement Newest Plan and Log Completion
+rounded-gallimimus,V3/ad-hoc-vague,swe-2-high,bypass,1793894748,1793894799,Add a search box to the sessions page

@@ -1,0 +1,216 @@
+From 8d946359b1a5e5548dca658f7bf15a49e9612249 Mon Sep 17 00:00:00 2001
+From: bench <bench@local>
+Date: Thu, 5 Nov 2026 22:31:27 +0700
+Subject: [PATCH] bench: V1 vague output
+
+---
+ server/app.test.ts         | 39 ++++++++++++++++++++++++++++++++++++++
+ server/session/routes.ts   | 16 ++++++++++++++++
+ server/session/vtt.test.ts | 36 +++++++++++++++++++++++++++++++++++
+ server/session/vtt.ts      | 18 ++++++++++++++++++
+ web/src/lib/api.ts         |  1 +
+ web/src/pages/Review.tsx   | 19 ++++++++++++++++++-
+ 6 files changed, 128 insertions(+), 1 deletion(-)
+ create mode 100644 server/session/vtt.test.ts
+ create mode 100644 server/session/vtt.ts
+
+diff --git a/server/app.test.ts b/server/app.test.ts
+index 3489e77..3f26445 100644
+--- a/server/app.test.ts
++++ b/server/app.test.ts
+@@ -162,6 +162,45 @@ describe('REST + WS surface', () => {
+     ws.close();
+   });
+ 
++  it('exports the transcript as WebVTT for video tools', async () => {
++    const res = await app.inject({
++      method: 'POST',
++      url: '/api/sessions',
++      payload: { diarize: true },
++    });
++    const info = res.json() as { id: string };
++
++    const { ws, messages } = connectWs();
++    await vi.waitFor(() => expect(messages.length).toBeGreaterThan(0));
++
++    provider.emitFinal({ text: 'Hello.', speaker: 'Speaker 1', start_s: 1, end_s: 2 });
++    await vi.waitFor(() =>
++      expect(messages.some((m) => m.type === 'translation')).toBe(true),
++    );
++    await app.inject({ method: 'POST', url: `/api/sessions/${info.id}/stop` });
++
++    const vtt = await app.inject({
++      method: 'GET',
++      url: `/api/sessions/${info.id}/vtt`,
++    });
++    expect(vtt.statusCode).toBe(200);
++    expect(vtt.headers['content-type']).toBe('text/vtt');
++    expect(vtt.headers['content-disposition']).toBe(
++      `attachment; filename="${info.id}.vtt"`,
++    );
++    expect(vtt.body).toContain('WEBVTT\n\n');
++    expect(vtt.body).toContain(
++      '1\n00:00:01.000 --> 00:00:02.000\nSpeaker 1: Hello.\nXIN CHÀO',
++    );
++
++    const missing = await app.inject({
++      method: 'GET',
++      url: '/api/sessions/nope-1/vtt',
++    });
++    expect(missing.statusCode).toBe(404);
++    ws.close();
++  });
++
+   it('never fires a translation request for partial events (ADR-003)', async () => {
+     const res = await app.inject({
+       method: 'POST',
+diff --git a/server/session/routes.ts b/server/session/routes.ts
+index d299d3f..ebd9fbe 100644
+--- a/server/session/routes.ts
++++ b/server/session/routes.ts
+@@ -5,6 +5,7 @@ import { z } from 'zod';
+ import type { SessionManager } from './manager.js';
+ import { wavPathFor } from './markdown.js';
+ import { listSessions, readSession } from './store.js';
++import { srtToVtt } from './vtt.js';
+ 
+ const startSchema = z.object({
+   targetLang: z.string().min(1).max(60).optional(),
+@@ -75,6 +76,21 @@ export function registerSessionRoutes(
+     return stored;
+   });
+ 
++  // WebVTT export for video tools: converted from the stored .srt on
++  // demand, so mid-session cues already carry every landed translation and
++  // sessions recorded before the export existed work unchanged.
++  app.get('/api/sessions/:id/vtt', async (req, reply) => {
++    const { id } = req.params as { id: string };
++    const stored = await readSession(sessions.dir, id);
++    if (!stored) {
++      return reply.code(404).send({ error: `session not found: ${id}` });
++    }
++    return reply
++      .header('Content-Type', 'text/vtt')
++      .header('Content-Disposition', `attachment; filename="${id}.vtt"`)
++      .send(srtToVtt(stored.srt));
++  });
++
+   // Optional session audio (PLAN-010): only sessions whose frontmatter
+   // carries `audio_file` have a WAV to serve. Single-range support is all
+   // the <audio> element needs for seek.
+diff --git a/server/session/vtt.test.ts b/server/session/vtt.test.ts
+new file mode 100644
+index 0000000..b870887
+--- /dev/null
++++ b/server/session/vtt.test.ts
+@@ -0,0 +1,36 @@
++import { describe, expect, it } from 'vitest';
++import { formatCue, insertTranslationLine } from './srt.js';
++import { srtToVtt } from './vtt.js';
++
++describe('srtToVtt', () => {
++  it('adds the WEBVTT header and converts commas to dots in timestamps', () => {
++    const srt =
++      '1\n00:00:02,000 --> 00:00:04,800\nSpeaker 1: Hello.\n\n' +
++      '2\n00:00:05,100 --> 00:00:08,200\nHi there.\n\n';
++    expect(srtToVtt(srt)).toBe(
++      'WEBVTT\n\n' +
++        '1\n00:00:02.000 --> 00:00:04.800\nSpeaker 1: Hello.\n\n' +
++        '2\n00:00:05.100 --> 00:00:08.200\nHi there.\n',
++    );
++  });
++
++  it('keeps spliced translation lines inside their cue', () => {
++    const srt = insertTranslationLine(
++      formatCue(0, { text: 'Hello.', start_s: 1, end_s: 2 }),
++      0,
++      'Xin chào.',
++    )!;
++    const vtt = srtToVtt(srt);
++    expect(vtt).toContain('00:00:01.000 --> 00:00:02.000\nHello.\nXin chào.');
++  });
++
++  it('leaves commas outside timestamp lines untouched', () => {
++    const srt = '1\n00:00:01,000 --> 00:00:02,000\none, two, three\n\n';
++    expect(srtToVtt(srt)).toContain('one, two, three');
++  });
++
++  it('emits a header-only document for an empty transcript', () => {
++    expect(srtToVtt('')).toBe('WEBVTT\n');
++    expect(srtToVtt('\n\n')).toBe('WEBVTT\n');
++  });
++});
+diff --git a/server/session/vtt.ts b/server/session/vtt.ts
+new file mode 100644
+index 0000000..b857b1a
+--- /dev/null
++++ b/server/session/vtt.ts
+@@ -0,0 +1,18 @@
++// WebVTT export derived from the stored .srt (ADR-007). The SRT stays the
++// canonical transcript artifact; the VTT is generated on demand so it always
++// reflects the latest translation splices and works for sessions recorded
++// before the export existed. The conversion is line-level: SRT cue numbers
++// become VTT cue identifiers, `,` millisecond separators become `.`, and a
++// `WEBVTT` magic header goes on top.
++export function srtToVtt(srt: string): string {
++  const body = srt
++    .split('\n')
++    .map((line) =>
++      line.includes(' --> ')
++        ? line.replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, '$1.$2')
++        : line,
++    )
++    .join('\n')
++    .trim();
++  return body === '' ? 'WEBVTT\n' : `WEBVTT\n\n${body}\n`;
++}
+diff --git a/web/src/lib/api.ts b/web/src/lib/api.ts
+index 73076a5..b820fa8 100644
+--- a/web/src/lib/api.ts
++++ b/web/src/lib/api.ts
+@@ -51,4 +51,5 @@ export const sessionsApi = {
+     api<StoredSession>(`/api/sessions/${encodeURIComponent(id)}`),
+   audioUrl: (id: string) =>
+     `/api/sessions/${encodeURIComponent(id)}/audio`,
++  vttUrl: (id: string) => `/api/sessions/${encodeURIComponent(id)}/vtt`,
+ };
+diff --git a/web/src/pages/Review.tsx b/web/src/pages/Review.tsx
+index 608919f..0ed3b66 100644
+--- a/web/src/pages/Review.tsx
++++ b/web/src/pages/Review.tsx
+@@ -6,7 +6,13 @@ import {
+   useState,
+ } from 'react';
+ import { useNavigate, useParams } from 'react-router';
+-import { ArrowLeft, CircleHelp, Clock, ScrollText } from 'lucide-react';
++import {
++  ArrowLeft,
++  CircleHelp,
++  Clock,
++  Download,
++  ScrollText,
++} from 'lucide-react';
+ import { toast } from 'sonner';
+ import { cn } from 'cn';
+ import { SessionAudioPlayer } from '@/components/audio-player';
+@@ -147,6 +153,17 @@ export function ReviewPage() {
+             {label}: {name}
+           </Badge>
+         ))}
++        {cues.length > 0 ? (
++          <Button
++            variant="outline"
++            size="sm"
++            className="ml-auto"
++            render={<a href={sessionsApi.vttUrl(meta.id)} download />}
++          >
++            <Download data-icon="inline-start" />
++            .vtt
++          </Button>
++        ) : null}
+       </div>
+       {meta.audio_file ? (
+         <SessionAudioPlayer
+-- 
+2.50.0
+

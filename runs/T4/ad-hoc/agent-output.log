@@ -1,0 +1,9 @@
+I'll check how sessions are named/identified on the server side to know what to match against.Now I'll implement. First, a pure filter helper plus a test (vitest runs in node env, so the filter logic gets a unit test rather than a component test).Now update the Sessions page to add the search input and filtered rendering.Now verify `SearchX` exists in this lucide version and run tests + typecheck.All 149 tests pass. Now typecheck:Both pass. Let me also run the web linter for good measure:Lint flags a conditional hook. The filter is cheap; I'll compute it plainly before the early returns instead of `useMemo`.Everything passes. Here's a final look at the changed render block:Done. Search/filter added to the Sessions page.
+
+**Changes**
+
+- `web/src/lib/filter-sessions.ts` (new): `filterSessions(sessions, query)` trims and lowercases the query, then matches against the session id (the `<date>-<slug>-<HHmm>` name shown in the table) and the locale-formatted `started_at` date. Empty/whitespace query returns the full list, so clearing restores everything.
+- `web/src/lib/filter-sessions.test.ts` (new): covers empty query passthrough, case-insensitive id matching, date matching, and the no-match case.
+- `web/src/pages/Sessions.tsx`: added a `type="search"` `Input` at the top of the card (live filtering on change, plus the native clear affordance), renders the filtered rows, and shows an `Empty` state with a `SearchX` icon and "No matching sessions" message when nothing matches, reusing the same shadcn components already on the page.
+
+**Verified**: `npm test` (149 tests, 17 files) and `npm run typecheck` pass; `oxlint` clean on touched files.
