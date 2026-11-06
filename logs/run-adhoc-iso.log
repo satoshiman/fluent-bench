@@ -1,0 +1,5 @@
+Preparing worktree (detached HEAD 81dd398)
+run ready: ~/fluent-bench/runs-isolated/T2-ad-hoc
+base commit: 2fc0a2d
+>>> T2 ad-hoc isolated 11:13:02
+<<< T2 ad-hoc isolated done 11:15:11

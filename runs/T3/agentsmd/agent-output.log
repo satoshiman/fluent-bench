@@ -1,0 +1,34 @@
+I'll start by exploring the workspace structure and the relevant code.This is a real-time transcription app. Let me look at the STT layer and check for the CONTEXTS directory the AGENTS.md references.Now let me look at the other STT files, tests, and the server ws bridge.Let me look at the session manager to see how streams are used and how errors reach the client.Let me check `app.test.ts` and the config to understand test seams and error surfacing.I have a good picture now. Let me check for other `start_stream` usages and the web client's error handling before designing.Let me check `server/index.ts` and the web client's session handling to confirm the event channel.I have the full picture. Per AGENTS.md this repo requires a plan doc in `CONTEXTS/03-implement-plan/` before implementation, plus an event log via `event.py` (which doesn't exist yet). Let me set up the workflow.Now the verification pass required by the workflow. I'll re-check the plan's claims against the code:
+
+- `withIdleTimeout` spreads `...events`, so `onReconnect` forwards automatically ✓
+- `sttProviderContract` unaffected (wrapper not added to contract suite) ✓
+- FakeProvider's `close()` emits `onClose` → deliberate-close path works ✓
+- Backoff schedule: drop → delays 1,2,4,8,16s before attempts 1-5, then give up ✓
+- `ServerEvent` error already carries optional `code` ✓
+
+The plan is consistent; recording the pass.Plan verified and gate satisfied. Now implementing: first `provider.ts`, the new `reconnect.ts`, and the `index.ts` wiring.Now the reconnect test suite with a mocked socket:Two fixes needed in the test: `events` is private on `FakeStream` but accessed externally, and the leftover `emitter` lines should go.Now add the end-to-end coverage in `app.test.ts`. First extend `FakeProvider` to support failing `start_stream`, then add the reconnect describe block.Bug in the second test: `failStarts = 99` set before session start would also fail the initial `start_stream`, returning 500 instead of 201. I need to arm failures after the session is up.Now run typecheck and the test suite.Same issue in the unit test: `failuresLeft = 99` was set before the initial `start_stream`, so session open itself failed. Arm failures after the stream is up.All 154 tests pass and typecheck is clean. Now the closeout per AGENTS.md: tick the DoD, mark the plan implemented, then build the missing `event.py` tooling, commit, and log.Now create the `event.py` tooling the AGENTS.md references (it's missing from the repo).Script works. Now the commit sequence: tooling first, then the feature (so the logged event binds the feature commit), then log, then the log file.Cleaning up the `__pycache__` artifact and doing a final sanity check of the log tooling.Done. `npm test` (154 passing) and `npm run typecheck` both pass.
+
+## What changed
+
+**New `server/stt/reconnect.ts`** - a `withReconnect(provider)` decorator, matching the existing `withIdleTimeout` pattern:
+
+- Unexpected `close` or `error` mid-stream starts a retry sequence: up to 5 attempts, delays `1s * 2^n` with equal jitter (`0.5-1x` nominal, `random` injectable for tests).
+- `send_audio` during an outage goes to a bounded buffer (256 chunks, newest dropped, same convention as Deepgram's `preOpen`); on a successful reconnect the wrapper emits `onReconnect` and flushes the buffer into the new stream in order.
+- Error+close dedupe to one sequence via a `reconnecting` flag; a successful reconnect resets the retry budget.
+- `close()` (deliberate stop/pause/shutdown/idle-timeout) cancels pending retries and never reconnects.
+- After the 5th failure it emits one `SttReconnectError` (`code: STT_RECONNECT_FAILED`) then one `onClose`, so the manager's existing unexpected-close path finalizes the session.
+
+**Wiring** (`server/stt/index.ts`): `withIdleTimeout(withReconnect(provider))` - reconnect sits below idle-timeout so idle shutdown arrives as a deliberate `close()` and correctly skips retries.
+
+**`server/stt/provider.ts`**: added optional `onReconnect?()` to `StreamEvents` (forwarded automatically through `withIdleTimeout`'s spread).
+
+**`server/session/manager.ts`**: extracted `refreshStreamBase()`, now called on stream open and on `onReconnect` so segment timestamps stay cumulative across a reconnect (same invariant as pause/resume); `handleSttError` now forwards `err.code` on the broadcast error event.
+
+## Tests (all mocked, no network/keys)
+
+- `server/stt/reconnect.test.ts`: flush after drop, exact backoff timing then terminal error, no retry on deliberate close or mid-backoff close, error/close dedupe, fresh retry budget, event forwarding.
+- `server/app.test.ts` + `stt reconnect` suite: end-to-end proof the session stays active across a drop with buffered audio flushed, and `STT_RECONNECT_FAILED` reaches the ws client with session finalizing on exhaustion.
+
+## AGENTS.md workflow
+
+Since `CONTEXTS/` didn't exist, I bootstrapped it: `PLAN-011-stt-ws-reconnect.md` (drafted, verified `review_count: 1`/`patch: not-needed`, DoD ticked, `status: implemented`), created the missing `CONTEXTS/04-logs/event.py` per the documented CLI, and logged the event bound to commit `a236857`.

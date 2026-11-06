@@ -1,0 +1,43 @@
+Preparing worktree (detached HEAD 81dd398)
+run ready: ~/fluent-bench/runs-isolated/T2-agentsmd
+base commit: b534e94
+>>> T2 agentsmd 10:52:06
+On branch main
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	.end_time
+	.start_time
+	agent-output.log
+	transcript.json
+
+nothing added to commit but untracked files present (use "git add" to track)
+<<< T2 agentsmd done 10:54:56
+Preparing worktree (detached HEAD 81dd398)
+run ready: ~/fluent-bench/runs-isolated/T3-agentsmd
+base commit: e03a2ab
+>>> T3 agentsmd 10:55:09
+On branch main
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	.end_time
+	.start_time
+	agent-output.log
+	transcript.json
+
+nothing added to commit but untracked files present (use "git add" to track)
+<<< T3 agentsmd done 11:02:46
+Preparing worktree (detached HEAD 81dd398)
+run ready: ~/fluent-bench/runs-isolated/T4-agentsmd
+base commit: 6d9c4f3
+>>> T4 agentsmd 11:02:57
+On branch main
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	.end_time
+	.start_time
+	agent-output.log
+	transcript.json
+
+nothing added to commit but untracked files present (use "git add" to track)
+<<< T4 agentsmd done 11:04:28
+=== ALL DONE ===

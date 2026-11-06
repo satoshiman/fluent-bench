@@ -61,6 +61,12 @@ Endpoint: `npm test` and `npm run typecheck` green, output reviewable
 as a mergeable diff. The full driver is `harness/run-all.sh`; the
 three-session doc-centric protocol is `harness/run-doccentric.sh`.
 
+## Isolated and invalidated runs
+
+- `runs/T{2,3,4}/agentsmd`, `runs/T2/ad-hoc-isolated`: AGENTS.md-only arm and the T2 ad-hoc rerun, executed as standalone clones (`ISOLATED=1`, see `harness/new-run.sh`). These are the canonical numbers for those cells.
+- `runs/T2/ad-hoc-contaminated`, `runs/T2/agentsmd-leaky`, `runs/T3/agentsmd-leaky`: invalidated runs kept for transparency (context leaked via shared refs, sibling worktrees, or an always-on AGENTS.md injected through the node_modules symlink). Not used in reported results.
+- `metrics/*.csv` were extracted before these runs and do not include them; per-run totals are in `results.csv`.
+
 ## Data notes
 
 - Transcripts are raw session exports. The only post-processing is

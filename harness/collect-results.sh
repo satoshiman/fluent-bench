@@ -23,4 +23,7 @@ done
 for i in 1 2 3; do
   emit "C$i" "doc-centric" "$BENCH/runs/chain/work" "$BENCH/runs/chain/work/transcript-C$i.json"
 done
+for t in T2 T3 T4; do
+  emit "$t" "agentsmd" "$BENCH/runs-isolated/$t-agentsmd" "$BENCH/runs-isolated/$t-agentsmd/transcript.json"
+done
 cat "$CSV"

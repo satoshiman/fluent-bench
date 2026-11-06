@@ -132,3 +132,48 @@ chain/work	zz-hidden-c.test.ts	C1 hidden: pause/resume recording > a second paus
 chain/work	zz-hidden-c.test.ts	C2 hidden: size cap with rotation > rotates into ordered sibling parts at the cap	passed
 chain/work	zz-hidden-c.test.ts	C2 hidden: size cap with rotation > part names make ordering obvious	passed
 chain/work	zz-hidden-c.test.ts	C2 hidden: size cap with rotation > uncapped recording writes a single file (cap is opt-in)	passed
+T2/agentsmd	zz-hidden-t2.test.ts	T2 hidden: translation retry > retries a network error then succeeds	passed
+T2/agentsmd	zz-hidden-t2.test.ts	T2 hidden: translation retry > retries HTTP 500 then succeeds	passed
+T2/agentsmd	zz-hidden-t2.test.ts	T2 hidden: translation retry > retries HTTP 429 then succeeds	passed
+T2/agentsmd	zz-hidden-t2.test.ts	T2 hidden: translation retry > does not retry HTTP 400	passed
+T2/agentsmd	zz-hidden-t2.test.ts	T2 hidden: translation retry > does not retry HTTP 401	passed
+T2/agentsmd	zz-hidden-t2.test.ts	T2 hidden: translation retry > does not retry HTTP 404	passed
+T2/agentsmd	zz-hidden-t2.test.ts	T2 hidden: translation retry > gives up after at most 3 attempts and surfaces the error	passed
+T2/agentsmd	zz-hidden-t2.test.ts	T2 hidden: translation retry > does not retry a malformed (empty) response	passed
+T2/agentsmd	zz-hidden-t2.test.ts	T2 hidden: translation retry > does not retry a successful response	passed
+T2/agentsmd	zz-hidden-t2.test.ts	T2 hidden: translation retry > backoff waits before retrying (floor from spec)	passed
+T3/agentsmd	zz-hidden-t3.test.ts	T3 hidden: STT reconnect > reconnects after an unexpected socket drop	passed
+T3/agentsmd	zz-hidden-t3.test.ts	T3 hidden: STT reconnect > flushes audio buffered during the outage onto the new stream	passed
+T3/agentsmd	zz-hidden-t3.test.ts	T3 hidden: STT reconnect > does not reconnect after a deliberate close	passed
+T3/agentsmd	zz-hidden-t3.test.ts	T3 hidden: STT reconnect > surfaces an error after exhausting reconnect attempts	failed
+T3/agentsmd	zz-hidden-t3.test.ts	T3 hidden: STT reconnect > keeps forwarding transcript events after reconnect	passed
+T2/agentsmd	zz-hidden-t2.test.ts	T2 hidden: translation retry > retries a network error then succeeds	passed
+T2/agentsmd	zz-hidden-t2.test.ts	T2 hidden: translation retry > retries HTTP 500 then succeeds	passed
+T2/agentsmd	zz-hidden-t2.test.ts	T2 hidden: translation retry > retries HTTP 429 then succeeds	passed
+T2/agentsmd	zz-hidden-t2.test.ts	T2 hidden: translation retry > does not retry HTTP 400	passed
+T2/agentsmd	zz-hidden-t2.test.ts	T2 hidden: translation retry > does not retry HTTP 401	passed
+T2/agentsmd	zz-hidden-t2.test.ts	T2 hidden: translation retry > does not retry HTTP 404	passed
+T2/agentsmd	zz-hidden-t2.test.ts	T2 hidden: translation retry > gives up after at most 3 attempts and surfaces the error	passed
+T2/agentsmd	zz-hidden-t2.test.ts	T2 hidden: translation retry > does not retry a malformed (empty) response	passed
+T2/agentsmd	zz-hidden-t2.test.ts	T2 hidden: translation retry > does not retry a successful response	passed
+T2/agentsmd	zz-hidden-t2.test.ts	T2 hidden: translation retry > backoff waits before retrying (floor from spec)	passed
+T3/agentsmd	zz-hidden-t3.test.ts	T3 hidden: STT reconnect > reconnects after an unexpected socket drop	passed
+T3/agentsmd	zz-hidden-t3.test.ts	T3 hidden: STT reconnect > flushes audio buffered during the outage onto the new stream	passed
+T3/agentsmd	zz-hidden-t3.test.ts	T3 hidden: STT reconnect > does not reconnect after a deliberate close	passed
+T3/agentsmd	zz-hidden-t3.test.ts	T3 hidden: STT reconnect > surfaces an error after exhausting reconnect attempts	failed
+T3/agentsmd	zz-hidden-t3.test.ts	T3 hidden: STT reconnect > keeps forwarding transcript events after reconnect	passed
+T4/agentsmd	zz-hidden-t4.test.ts	T4 hidden: sessions search filter > exposes a testable filter function	passed
+T4/agentsmd	zz-hidden-t4.test.ts	T4 hidden: sessions search filter > matches the session name case-insensitively	passed
+T4/agentsmd	zz-hidden-t4.test.ts	T4 hidden: sessions search filter > matches the session date (ISO form)	passed
+T4/agentsmd	zz-hidden-t4.test.ts	T4 hidden: sessions search filter > returns an empty list when nothing matches	passed
+T4/agentsmd	zz-hidden-t4.test.ts	T4 hidden: sessions search filter > empty and whitespace queries restore the full list	passed
+T2/ad-hoc-iso	zz-hidden-t2.test.ts	T2 hidden: translation retry > retries a network error then succeeds	passed
+T2/ad-hoc-iso	zz-hidden-t2.test.ts	T2 hidden: translation retry > retries HTTP 500 then succeeds	passed
+T2/ad-hoc-iso	zz-hidden-t2.test.ts	T2 hidden: translation retry > retries HTTP 429 then succeeds	passed
+T2/ad-hoc-iso	zz-hidden-t2.test.ts	T2 hidden: translation retry > does not retry HTTP 400	passed
+T2/ad-hoc-iso	zz-hidden-t2.test.ts	T2 hidden: translation retry > does not retry HTTP 401	passed
+T2/ad-hoc-iso	zz-hidden-t2.test.ts	T2 hidden: translation retry > does not retry HTTP 404	passed
+T2/ad-hoc-iso	zz-hidden-t2.test.ts	T2 hidden: translation retry > gives up after at most 3 attempts and surfaces the error	passed
+T2/ad-hoc-iso	zz-hidden-t2.test.ts	T2 hidden: translation retry > does not retry a malformed (empty) response	passed
+T2/ad-hoc-iso	zz-hidden-t2.test.ts	T2 hidden: translation retry > does not retry a successful response	passed
+T2/ad-hoc-iso	zz-hidden-t2.test.ts	T2 hidden: translation retry > backoff waits before retrying (floor from spec)	passed

@@ -1,0 +1,18 @@
+I'll start by exploring the workspace to understand the project structure.Now let me check how the OpenAI SDK surfaces errors, so I can classify retryable vs non-retryable failures.Let me check how `OpenAI.APIError` is exposed in the installed SDK version.The SDK exposes `OpenAI.APIError` / `OpenAI.APIConnectionError` as statics. Let me quickly check the `APIError` constructor implementation so tests can construct instances safely.I have a clear picture now. Plan:
+
+1. New `server/translate/retry.ts` with `withRetry` (exponential backoff + jitter) and `isRetryableError` (classifies SDK connection errors, 429, 5xx).
+2. Wrap the translator's per-endpoint `request()` calls in `withRetry`, keeping the existing `TranslationError` error path.
+3. Add tests in `openai-compat.test.ts` (5xx→success, 4xx immediate fail, exhaustion) plus a `retry.test.ts` for the helper.Now update the translator to wrap each endpoint request with `withRetry`:Now the tests. First, a unit test file for the retry helper:Now add the translator-level retry tests to `openai-compat.test.ts`:Now run typecheck and tests:TypeScript loses the `undefined` narrowing inside the closure. I'll capture `this.fallback` in a local:All 170 tests pass and typecheck is clean. Summary of changes:
+
+**`server/translate/retry.ts`** (new)
+- `withRetry(fn, options)`: up to 3 attempts, exponential backoff of 500ms → 1000ms with ±10% random jitter. `sleep` and `random` are injectable for deterministic tests.
+- `isRetryableError(err)`: retryable iff the error (or its `cause` chain) is an `APIConnectionError`/`APIConnectionTimeoutError`, an `APIError` with status 429 or ≥500, or carries a transient socket code (`ECONNRESET`, `ETIMEDOUT`, undici timeouts, etc.). Everything else, including other 4xx and `TranslationError` from malformed/empty responses, fails immediately.
+
+**`server/translate/openai-compat.ts`** [openai-compat.ts:33-70](file://~/fluent-bench/runs-isolated/T2-ad-hoc/server/translate/openai-compat.ts)
+- Each endpoint `request()` (primary and fallback) is wrapped in `withRetry`, with an optional 4th constructor param for retry overrides. After exhaustion the original error propagates into the existing `TranslationError` wrapping, so callers see the same error path as before.
+
+**Tests**
+- `server/translate/retry.test.ts`: classification unit tests plus backoff timing (`[500, 1000]` recorded delays) and jitter bounds.
+- `server/translate/openai-compat.test.ts`: new `retries` describe covering 5xx-then-success, 429, connection error, immediate 4xx failure (1 call), malformed response (no retry), and exhaustion after 3 attempts — all with fake clients, no real API hits.
+
+Note: `withRetry` lives in `server/translate/` since only the translator needed it; `server/assist/openai-compat.ts` explicitly documents "no retries beyond" a single fallback attempt, so I left it unchanged.
