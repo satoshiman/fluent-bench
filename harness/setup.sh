@@ -7,6 +7,7 @@ if [ ! -d "$HERE/repo" ]; then
   git clone https://github.com/satoshiman/fluent "$HERE/repo"
 fi
 cd "$HERE/repo"
+git fetch --tags -q
 git checkout -B bench-base "$BASE_COMMIT"
 npm install
 (cd web && npm install)

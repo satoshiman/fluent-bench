@@ -69,9 +69,9 @@ three-session doc-centric protocol is `harness/run-doccentric.sh`.
   `total_time_ms` per run gives the "active time" column reported in
   the paper (invalidated/contaminated sessions are marked in
   `metrics/sessions.csv` by their `run_dir`/`title`).
-- The `ad-hoc` base is a squash snapshot of the `bench-base` commit
-  (`81dd398` on `satoshiman/fluent`); the `doc-centric` base is
-  `bench-base` itself.
+- The `ad-hoc` base is a squash snapshot of `bench-base`
+  (`81dd398`, tagged on `satoshiman/fluent`); the `doc-centric` base
+  is `bench-base` itself.
 
 ## License
 
